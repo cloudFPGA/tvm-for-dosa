@@ -820,6 +820,7 @@ to be the last item in the input shape.
     .add_argument("gamma", "Tensor", "The gamma scale factor.")
     .add_argument("beta", "Tensor", "The beta offset factor.")
     .set_support_level(1)
+    .set_attr<TOpPattern>("TOpPattern", kOpaque)
     .add_type_rel("InstanceNorm", InstanceNormRel);
 
 // layer_norm
