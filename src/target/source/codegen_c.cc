@@ -22,6 +22,8 @@
  */
 #include "codegen_c.h"
 
+#include <tvm/arith/analyzer.h>
+
 #include <cctype>
 #include <iomanip>
 
@@ -83,6 +85,7 @@ void CodeGenC::AddFunction(const PrimFunc& f) {
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
 
   this->PrintFuncPrefix();
+  this->PrintExtraAttrs(f);
   this->stream << " " << static_cast<std::string>(global_symbol.value()) << "(";
 
   for (size_t i = 0; i < f->params.size(); ++i) {
@@ -105,8 +108,8 @@ void CodeGenC::AddFunction(const PrimFunc& f) {
         }
       }
 
-      if (no_alias && restrict_keyword_.length() != 0) {
-        stream << ' ' << restrict_keyword_;
+      if (no_alias) {
+        PrintRestrict(v, stream);
       }
     } else {
       PrintType(GetType(v), stream);
@@ -124,6 +127,8 @@ void CodeGenC::AddFunction(const PrimFunc& f) {
 }
 
 void CodeGenC::PrintFuncPrefix() { stream << "void"; }
+
+void CodeGenC::PrintExtraAttrs(const PrimFunc& f) {}
 
 void CodeGenC::PrintFinalReturn() {}
 
@@ -355,61 +360,6 @@ void CodeGenC::PrintStorageSync(const CallNode* op) {  // NOLINT(*)
 
 void CodeGenC::PrintStorageScope(const std::string& scope, std::ostream& os) {  // NOLINT(*)
   ICHECK_EQ(scope, "global");
-}
-
-void CodeGenC::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
-  ICHECK_EQ(t.lanes(), 1) << "do not yet support vector types";
-  if (t.is_handle()) {
-    os << "void*";
-    return;
-  }
-  if (t.is_float()) {
-    if (t.bits() == 32) {
-      os << "float";
-      return;
-    }
-    if (t.bits() == 64) {
-      os << "double";
-      return;
-    }
-  } else if (t.is_uint()) {
-    switch (t.bits()) {
-      case 8:
-      case 16:
-      case 32:
-      case 64: {
-        os << "uint" << t.bits() << "_t";
-        return;
-      }
-      case 1:
-        os << "int";
-        return;
-    }
-  } else if (t.is_int()) {
-    switch (t.bits()) {
-      case 8:
-      case 16:
-      case 32:
-      case 64: {
-        os << "int" << t.bits() << "_t";
-        return;
-      }
-    }
-  }
-  LOG(FATAL) << "Cannot convert type " << t << " to C type";
-}
-
-void CodeGenC::PrintType(const Type& type, std::ostream& os) {  // NOLINT(*)
-  if (auto* ptr = type.as<PrimTypeNode>()) {
-    return PrintType(ptr->dtype, os);
-  } else if (auto* ptr = type.as<PointerTypeNode>()) {
-    PrintType(ptr->element_type, os);
-    os << '*';
-  } else if (IsVoidType(type)) {
-    os << "void";
-  } else {
-    LOG(FATAL) << "Type " << type << " does not have a corresponding C Type";
-  }
 }
 
 inline void PrintConst(const IntImmNode* op, std::ostream& os, CodeGenC* p) {  // NOLINT(*)
@@ -707,8 +657,19 @@ void CodeGenC::VisitExpr_(const LoadNode* op, std::ostream& os) {  // NOLINT(*)
   } else {
     ICHECK(is_one(op->predicate)) << "predicated load is not supported";
 
+    bool can_vector_load = false;
     arith::PVar<PrimExpr> base;
     if (arith::ramp(base, 1, op->dtype.lanes()).Match(op->index)) {
+      const RampNode* ramp = op->index.as<RampNode>();
+      ICHECK(ramp);
+      arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
+      // The condition: {k * coeff + base} divisible by the alignment for any k
+      if (me->coeff % op->dtype.lanes() == 0 && me->base % op->dtype.lanes() == 0) {
+        can_vector_load = true;
+      }
+    }
+
+    if (can_vector_load) {
       std::string ref = GetVecLoad(op->dtype, op->buffer_var.get(), base.Eval());
       HandleVolatileLoads(ref, op, os);
     } else {
@@ -861,12 +822,11 @@ void CodeGenC::VisitStmt_(const AllocateNode* op) {
   this->PrintIndent();
   int32_t constant_size = op->constant_allocation_size();
   ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
-  const VarNode* buffer = op->buffer_var.as<VarNode>();
-  auto it = alloc_storage_scope_.find(buffer);
-  if (it != alloc_storage_scope_.end()) {
-    std::string scope = alloc_storage_scope_.at(buffer);
-    PrintStorageScope(scope, stream);
-  }
+
+  auto scope = GetPtrStorageScope(op->buffer_var);
+  alloc_storage_scope_[op->buffer_var.get()] = scope;
+  PrintStorageScope(scope, stream);
+
   PrintType(op->dtype, stream);
   stream << ' ' << vid << '[' << constant_size << "];\n";
 
@@ -882,10 +842,6 @@ void CodeGenC::VisitStmt_(const AttrStmtNode* op) {
         BindThreadIndex(iv);
       }
     }
-  } else if (op->attr_key == tir::attr::storage_scope) {
-    const VarNode* v = op->node.as<VarNode>();
-    ICHECK(v);
-    alloc_storage_scope_[v] = op->value.as<StringImmNode>()->value;
   } else if (op->attr_key == tir::attr::volatile_scope) {
     const VarNode* v = op->node.as<VarNode>();
     ICHECK(v);
@@ -1018,6 +974,12 @@ void CodeGenC::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
     os << "))";
   }
   return;
+}
+
+void CodeGenC::PrintRestrict(const Var& v, std::ostream& os) {
+  if (restrict_keyword_.length() != 0) {
+    os << ' ' << restrict_keyword_;
+  }
 }
 
 static bool CheckOutermostBracketMatch(const std::string& s) {

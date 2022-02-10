@@ -50,43 +50,6 @@ inline String get_name_mangled(const String& module_name, const String& name) {
 }
 
 /*!
- * \brief Structure that can be optionally used by the executor codegen
- */
-class MetadataNode : public Object {
- public:
-  /*! \brief number of inputs of the main function */
-  int num_inputs = 1;
-  /*! \brief number of outputs of the main function */
-  int num_outputs = 1;
-  /*! \brief the executor to be used to run the model */
-  String executor = kTvmExecutorGraph;
-
-  String mod_name = "";
-
-  static constexpr const uint32_t _type_index = TypeIndex::kDynamic;
-  static constexpr const char* _type_key = "MetadataObj";
-  TVM_DECLARE_FINAL_OBJECT_INFO(MetadataNode, Object);
-};
-
-/*!
- * \brief Managed reference to MetadataNode.
- */
-class Metadata : public ObjectRef {
- public:
-  TVM_DLL Metadata(int num_inputs, int num_outputs, String executor, String mod_name) {
-    auto n = make_object<MetadataNode>();
-    n->num_inputs = num_inputs;
-    n->num_outputs = num_outputs;
-    n->executor = executor;
-    n->mod_name = mod_name;
-    data_ = std::move(n);
-  }
-
-  TVM_DEFINE_OBJECT_REF_METHODS(Metadata, ObjectRef, MetadataNode);
-  TVM_DEFINE_OBJECT_REF_COW_METHOD(MetadataNode);
-};
-
-/*!
  * \brief Create a metadata module object.
  *
  * \param metadata The variable name to ndarray mapping.
@@ -99,11 +62,14 @@ Module MetadataModuleCreate(
     const std::unordered_map<std::string, NDArray>& metadata,
     const std::unordered_map<std::string, std::vector<std::string>>& sym_vars);
 
+/*! \brief A tag to specify whether or not dynamic shared memory is used */
+constexpr const char* kUseDynamicSharedMemoryTag = "tir.use_dyn_shared_memory";
+
 /*! \brief function information needed by device */
 struct FunctionInfo {
   std::string name;
   std::vector<DLDataType> arg_types;
-  std::vector<std::string> thread_axis_tags;
+  std::vector<std::string> launch_param_tags;
 
   void Save(dmlc::JSONWriter* writer) const;
   void Load(dmlc::JSONReader* reader);

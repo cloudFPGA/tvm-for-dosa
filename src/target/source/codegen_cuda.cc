@@ -23,7 +23,9 @@
 
 #include "codegen_cuda.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/runtime/registry.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <cmath>
 #include <string>
@@ -31,6 +33,7 @@
 #include <vector>
 
 #include "literal/cuda_half_t.h"
+#include "ptx_mma.h"
 
 namespace tvm {
 namespace codegen {
@@ -45,6 +48,45 @@ void CodeGenCUDA::Init(bool output_ssa) {
 }
 
 void CodeGenCUDA::PrintFuncPrefix() { stream << "extern \"C\" __global__ void"; }
+
+class ThreadIdxExtractor : public tir::StmtVisitor {
+ private:
+  void VisitStmt_(const AttrStmtNode* op) final {
+    if (op->attr_key == tir::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      if (iv->var->name_hint == "threadIdx.x" || iv->thread_tag == "threadIdx.x") {
+        threadIdx_x_ext = op->value;
+      }
+      if (iv->var->name_hint == "threadIdx.y" || iv->thread_tag == "threadIdx.y") {
+        threadIdx_y_ext = op->value;
+      }
+      if (iv->var->name_hint == "threadIdx.z" || iv->thread_tag == "threadIdx.z") {
+        threadIdx_z_ext = op->value;
+      }
+    }
+    StmtVisitor::VisitStmt_(op);
+  }
+
+ public:
+  PrimExpr threadIdx_x_ext = Integer(1);
+  PrimExpr threadIdx_y_ext = Integer(1);
+  PrimExpr threadIdx_z_ext = Integer(1);
+};
+
+void CodeGenCUDA::PrintExtraAttrs(const PrimFunc& f) {
+  ThreadIdxExtractor extractor;
+  extractor(f->body);
+  arith::Analyzer analyzer;
+  PrimExpr threadIdx_ext = analyzer.Simplify(extractor.threadIdx_x_ext * extractor.threadIdx_y_ext *
+                                             extractor.threadIdx_z_ext);
+  if (const IntImmNode* const threadIdx_ext_int = threadIdx_ext.as<IntImmNode>()) {
+    if (threadIdx_ext_int->value == 1) {
+      // unable to extract the number of threads per block, hence directly return
+      return;
+    }
+    stream << " __launch_bounds__(" << threadIdx_ext_int->value << ")";
+  }
+}
 
 std::string CodeGenCUDA::Finish() {
   if (enable_fp16_) {
@@ -484,7 +526,7 @@ void CodeGenCUDA::PrintStorageSync(const CallNode* op) {
   const std::string& sync = op->args[0].as<StringImmNode>()->value;
   if (sync == "warp") {
     // DO nothing.
-  } else if (sync == "shared") {
+  } else if (sync == "shared" || sync == "shared.dyn") {
     this->PrintIndent();
     this->stream << "__syncthreads();\n";
   } else if (sync == "global") {
@@ -525,6 +567,8 @@ void CodeGenCUDA::PrintStorageScope(const std::string& scope, std::ostream& os) 
                                 "all global arrays as input instead";
   if (scope == "shared") {
     os << "__shared__ ";
+  } else if (scope == "shared.dyn") {
+    os << "extern __shared__ ";
   }
 }
 
@@ -680,6 +724,38 @@ void CodeGenCUDA::VisitExpr_(const CallNode* op, std::ostream& os) {
       this->PrintExpr(op->args[i * 2 + 1], os);
       os << "]" << ((i < 3) ? ", " : ")");
     }
+  } else if (op->op.same_as(builtin::ptx_mma())) {
+    // arg 0: shape: mXnXkX
+    // arg 1: A layout: row/col
+    // arg 2: B layout: row/col
+    // arg 3: A precision: fp16, fp64, ...
+    // arg 4: B precision: fp16, fp64, ...
+    // arg 5: C precision: fp32, fp64, ...
+    // arg 6: A multiplicand
+    // arg 7: A multiplicand index
+    // arg 8: B multiplicand
+    // arg 9: B multiplicand index
+    // arg 10: C accumulator
+    // arg 11: C accumulator index
+    // arg 12: saturate
+    ICHECK_EQ(op->args.size(), 13U);
+    std::string shape = Downcast<StringImm>(op->args[0])->value;
+    std::string A_layout = Downcast<StringImm>(op->args[1])->value;
+    std::string B_layout = Downcast<StringImm>(op->args[2])->value;
+    std::string A_dtype = Downcast<StringImm>(op->args[3])->value;
+    std::string B_dtype = Downcast<StringImm>(op->args[4])->value;
+    std::string C_dtype = Downcast<StringImm>(op->args[5])->value;
+    std::string a_ref = this->PrintExpr(op->args[6]);
+    std::string a_bias = this->PrintExpr(op->args[7]);
+    std::string b_ref = this->PrintExpr(op->args[8]);
+    std::string b_bias = this->PrintExpr(op->args[9]);
+    std::string c_ref = this->PrintExpr(op->args[10]);
+    std::string c_bias = this->PrintExpr(op->args[11]);
+    bool saturate = (Downcast<IntImm>(op->args[12])->value != 0);
+    std::string asm_code = PrintMMAAssembly(shape, A_layout, B_layout, A_dtype, B_dtype, C_dtype,
+                                            a_ref, a_bias, b_ref, b_bias, c_ref, c_bias, saturate);
+
+    this->stream << asm_code;
   } else {
     CodeGenC::VisitExpr_(op, os);
   }
@@ -703,9 +779,8 @@ void CodeGenCUDA::VisitStmt_(const AllocateNode* op) {
   std::string vid = AllocVarID(op->buffer_var.get());
 
   this->PrintIndent();
-  int32_t constant_size = op->constant_allocation_size();
-  ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
   std::string scope = GetPtrStorageScope(op->buffer_var);
+  const VarNode* buffer = op->buffer_var.as<VarNode>();
   if (scope.find("wmma.") == 0) {
     if (scope == "wmma.matrix_a" || scope == "wmma.matrix_b") {
       ICHECK(op->dtype == DataType::Float(16) || op->dtype == DataType::Int(8) ||
@@ -719,19 +794,28 @@ void CodeGenCUDA::VisitStmt_(const AllocateNode* op) {
              op->dtype == DataType::Int(32))
           << "Accumulator only support half, float and int type for now";
     }
-    const VarNode* buffer = op->buffer_var.as<VarNode>();
-    constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
     PrintWmmaScope(scope, op->dtype, buffer, stream);
   } else {
     PrintStorageScope(scope, stream);
     PrintType(op->dtype, stream);
   }
-  if ((op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
-       op->dtype == DataType::Int(1)) &&
-      scope == "shared") {
-    constant_size = constant_size / (32 / op->dtype.bits());
+
+  if (scope == "shared.dyn") {
+    stream << ' ' << vid << "[];\n";
+  } else {
+    int32_t constant_size = op->constant_allocation_size();
+    ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation for now";
+
+    if (scope.find("wmma.") == 0) {
+      constant_size = GetWmmaFragmentSize(scope, buffer, constant_size);
+    }
+    if ((op->dtype == DataType::Int(4) || op->dtype == DataType::UInt(4) ||
+         op->dtype == DataType::Int(1)) &&
+        scope == "shared") {
+      constant_size = constant_size / (32 / op->dtype.bits());
+    }
+    stream << ' ' << vid << '[' << constant_size << "];\n";
   }
-  stream << ' ' << vid << '[' << constant_size << "];\n";
 
   RegisterHandleType(op->buffer_var.get(), op->dtype);
   this->PrintStmt(op->body);

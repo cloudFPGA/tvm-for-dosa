@@ -11,6 +11,7 @@ __pycache__/
 .Python
 env/
 build/
+build-*/
 develop-eggs/
 dist/
 downloads/
@@ -63,7 +64,7 @@ instance/
 
 # Sphinx documentation
 docs/_build/
-docs/gen_modules
+docs/_staging/
 
 # PyBuilder
 /target/
@@ -174,6 +175,7 @@ perf
 .bash_history
 *.json
 *.params
+*.ro
 *.onnx
 *.h5
 synset.txt
@@ -241,3 +243,9 @@ conda/pkg
 .tvm_test_data
 .dgl
 .caffe2
+
+# Local docs build
+_docs/
+jvm/target
+.config/configstore/
+.ci-py-scripts/

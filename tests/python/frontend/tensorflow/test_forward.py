@@ -27,6 +27,8 @@ import pytest
 
 try:
     import tensorflow.compat.v1 as tf
+
+    tf.disable_v2_behavior()
 except ImportError:
     import tensorflow as tf
 
@@ -124,7 +126,7 @@ def run_tvm_graph(
     disabled_pass=None,
     ignore_in_shape=False,
     serialize=False,
-    use_dense_op=True,
+    convert_config=None,
 ):
     """Generic function to compile on relay and execute on tvm"""
     input_data = convert_to_list(input_data)
@@ -143,11 +145,10 @@ def run_tvm_graph(
         layout=layout,
         shape=shape_dict,
         outputs=out_names,
-        use_dense_op=use_dense_op,
+        convert_config=convert_config,
     )
     dev = tvm.device(target, 0)
     if mode == "debug":
-        ex = relay.create_executor(mode, mod=mod, device=tvm.cpu(), target="llvm")
         inputs = []
         for param in mod["main"].params:
             found = False
@@ -159,7 +160,9 @@ def run_tvm_graph(
             # Interpreter doesn't bind constants, so still need to find in params
             if not found:
                 inputs.append(tvm.nd.array(params[param.name_hint]))
-        result = ex.evaluate()(*inputs)
+        result = relay.create_executor(mode, mod=mod, device=tvm.cpu(), target="llvm").evaluate()(
+            *inputs
+        )
         return vmobj_to_list(result)
     elif mode == "vm":
         with tvm.transform.PassContext(opt_level=opt_level, disabled_pass=disabled_pass):
@@ -225,7 +228,7 @@ def compare_tf_with_tvm(
     add_shapes_to_graph_def=True,
     targets=None,
     ignore_in_shape=False,
-    use_dense_op=True,
+    convert_config=None,
 ):
     """Generic function to generate and compare tensorflow and TVM output"""
 
@@ -273,7 +276,7 @@ def compare_tf_with_tvm(
                 mode=mode,
                 cuda_layout=cuda_layout,
                 ignore_in_shape=ignore_in_shape,
-                use_dense_op=use_dense_op,
+                convert_config=convert_config,
             )
             # since the names from tensorflow and relay runs are not exactly same,
             # first len(tf_output) will be compared
@@ -1482,19 +1485,29 @@ def test_tensor_array_scatter():
                 element_shape = tf.TensorShape([tf.Dimension(None)])
             else:
                 element_shape = None
-            t = tf.constant(np.array([[1.0], [2.0], [3.0]]).astype(dtype_str), dtype=dtype)
-            indices = tf.constant([2, 1, 0])
-            ta1 = tf.TensorArray(
-                dtype=dtype, size=3, infer_shape=infer_shape, element_shape=element_shape
-            )
-            ta2 = ta1.scatter(indices, t)
-            out0 = ta2.read(0)
-            out1 = ta2.read(1)
-            out2 = ta2.read(2)
+            ta0 = _construct_scatter(dtype, dtype_str, element_shape, infer_shape, 3)
+            out0 = ta0.read(0)
+            out1 = ta0.read(1)
+            out2 = ta0.read(2)
+            ta1 = _construct_scatter(dtype, dtype_str, element_shape, infer_shape, 4)
+            out4 = ta1.read(0)
             g = tf.get_default_graph()
             compare_tf_with_tvm([], [], ["TensorArrayReadV3:0"], mode="vm")
             compare_tf_with_tvm([], [], ["TensorArrayReadV3_1:0"], mode="vm")
             compare_tf_with_tvm([], [], ["TensorArrayReadV3_2:0"], mode="vm")
+            compare_tf_with_tvm([], [], ["TensorArrayReadV3_2:0", out4.name], mode="vm")
+
+    def _construct_scatter(dtype, dtype_str, element_shape, infer_shape, size):
+        arr = [[float(i)] for i in range(size)]
+        indices_arr = [i for i in range(size - 1, -1, -1)]
+
+        t = tf.constant(np.array(arr).astype(dtype_str), dtype=dtype)
+        indices = tf.constant(indices_arr)
+        ta1 = tf.TensorArray(
+            dtype=dtype, size=size, infer_shape=infer_shape, element_shape=element_shape
+        )
+        ta2 = ta1.scatter(indices, t)
+        return ta2
 
     for dtype in ["float32", "int8"]:
         run(dtype, False)
@@ -1811,8 +1824,12 @@ def _test_matmul(i, j, k, dtype, outer=None):
 
                 A_np = np.random.uniform(high=5.0, size=A_shape).astype(dtype)
                 B_np = np.random.uniform(high=5.0, size=B_shape).astype(dtype)
-                compare_tf_with_tvm([A_np, B_np], [A.name, B.name], result.name, use_dense_op=True)
-                compare_tf_with_tvm([A_np, B_np], [A.name, B.name], result.name, use_dense_op=False)
+                compare_tf_with_tvm(
+                    [A_np, B_np], [A.name, B.name], result.name, convert_config={"use_dense": True}
+                )
+                compare_tf_with_tvm(
+                    [A_np, B_np], [A.name, B.name], result.name, convert_config={"use_dense": False}
+                )
 
 
 def test_forward_matmul():
@@ -1830,7 +1847,18 @@ def _test_batch_matmul(A_shape, B_shape, dtype, adjoint_a=False, adjoint_b=False
 
         A_np = np.random.uniform(high=5.0, size=A_shape).astype(dtype)
         B_np = np.random.uniform(high=5.0, size=B_shape).astype(dtype)
-        compare_tf_with_tvm([A_np, B_np], [A.name, B.name], result.name)
+        compare_tf_with_tvm(
+            [A_np, B_np],
+            [A.name, B.name],
+            result.name,
+            convert_config={"use_nt_batch_matmul": True},
+        )
+        compare_tf_with_tvm(
+            [A_np, B_np],
+            [A.name, B.name],
+            result.name,
+            convert_config={"use_nt_batch_matmul": False},
+        )
 
 
 def _test_batch_matmul_dynamic(
@@ -1843,10 +1871,23 @@ def _test_batch_matmul_dynamic(
 
         A_np = np.random.uniform(high=5.0, size=A_np_shape).astype(dtype)
         B_np = np.random.uniform(high=5.0, size=B_np_shape).astype(dtype)
-        # for now, in TOPI, only cublas's implementation support dynamic shape
+        # for now, in TOPI, only llvm & cublas's implementation support dynamic shape
         # TODO add more backends support in TOPI
         compare_tf_with_tvm(
-            [A_np, B_np], [A.name, B.name], result.name, mode="vm", targets=["cuda -libs=cublas"]
+            [A_np, B_np],
+            [A.name, B.name],
+            result.name,
+            mode="vm",
+            targets=["llvm", "cuda -libs=cublas"],
+            convert_config={"use_nt_batch_matmul": True},
+        )
+        compare_tf_with_tvm(
+            [A_np, B_np],
+            [A.name, B.name],
+            result.name,
+            mode="vm",
+            targets=["llvm", "cuda -libs=cublas"],
+            convert_config={"use_nt_batch_matmul": False},
         )
 
 
@@ -1865,7 +1906,6 @@ def test_forward_batch_matmul():
     _test_batch_matmul((1, 8, 64), (64, 1), "float32", False, False)
 
 
-@tvm.testing.requires_cuda
 def test_forward_batch_matmul_dynamic():
     _test_batch_matmul_dynamic((None, 5, 4), (None, 4, 5), (3, 5, 4), (3, 4, 5), "int32")
     _test_batch_matmul_dynamic(
@@ -2484,9 +2524,15 @@ def _test_sparse_add(indices, values, A_shape, B_shape, dtype, flip=False):
 
         # TODO(ANSHUMAN87): support user input threashold values
         if flip:
-            result = tf.sparse.add(B, A_sp, threshold=0)
+            if package_version.parse(tf.VERSION) < package_version.parse("1.13.0"):
+                result = tf.sparse.add(B, A_sp, thresh=0)
+            else:
+                result = tf.sparse.add(B, A_sp, threshold=0)
         else:
-            result = tf.sparse.add(A_sp, B, threshold=0)
+            if package_version.parse(tf.VERSION) < package_version.parse("1.13.0"):
+                result = tf.sparse.add(A_sp, B, thresh=0)
+            else:
+                result = tf.sparse.add(A_sp, B, threshold=0)
 
         B_np = np.random.uniform(high=5.0, size=B_shape).astype(dtype)
 
@@ -5347,7 +5393,12 @@ def _test_spop_resource_variables():
 def test_forward_spop():
     _test_spop_stateful()
     _test_spop_device_assignment()
-    _test_spop_resource_variables()
+    # tensorflow version upgrade support
+    # This test is expected to fail in TF version >= 2.6
+    # as the generated graph will be considered frozen, hence
+    # not passing the criteria for the test below.
+    if tf.__version__ < LooseVersion("2.6.1"):
+        _test_spop_resource_variables()
 
     # Placeholder test cases
     _test_spop_placeholder_without_shape_info()

@@ -35,7 +35,7 @@ namespace te {
 
 using namespace tir;
 
-// Detect the region of input and output to be tensrized.
+// Detect the region of input and output to be tensorized.
 // out_dom: the domain of root iter vars in output op
 // in_region: region of each input tensor.
 // return The location of the tensorized scope start.
@@ -140,13 +140,13 @@ void VerifyTensorizeLoopNest(const ComputeOpNode* self, const Stage& stage,
   auto fbanned = [&](const VarNode* node) { return banned.count(node); };
 
   for (const PrimExpr& pred : n.main_predicates) {
-    if (tir::ExprUseVar(pred, fbanned)) {
+    if (tir::UsesVar(pred, fbanned)) {
       LOG(FATAL) << "Tensorize failed, split condition " << pred
                  << " relies on var defined inside tensorize scope";
     }
   }
   for (const PrimExpr& pred : n.init_predicates) {
-    if (tir::ExprUseVar(pred, fbanned)) {
+    if (tir::UsesVar(pred, fbanned)) {
       LOG(FATAL) << "Tensorize failed, split condition " << pred
                  << " relies on var defined inside tensorize scope";
     }
@@ -337,7 +337,8 @@ void VerifyTensorizeBody(const ComputeOpNode* self, const Stage& stage,
     }
     ICHECK(expr_equal(lhs, rhs)) << "Failed to match the compute with TensorIntrin " << intrin->name
                                  << "'s declaration "
-                                 << " provided= " << lhs << ", intrin=  " << rhs;
+                                 << " provided= " << lhs << ", intrin=  " << rhs
+                                 << ", running this stage: " << stage;
   }
 }
 

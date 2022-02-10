@@ -27,6 +27,7 @@
 #include <tvm/ir/type.h>
 #include <tvm/ir/type_functor.h>
 #include <tvm/node/serialization.h>
+#include <tvm/target/target.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/op.h>
@@ -35,6 +36,7 @@
 #include <algorithm>
 #include <string>
 
+#include "../tir/transforms/ir_utils.h"
 #include "doc.h"
 #include "meta_data.h"
 #include "text_printer.h"
@@ -64,10 +66,14 @@ Doc TIRTextPrinter::Print(const ObjectRef& node) {
     return PrintRange(node.as<RangeNode>());
   } else if (node->IsInstance<BufferNode>()) {
     return PrintBuffer(node.as<BufferNode>());
+  } else if (node->IsInstance<DataProducerNode>()) {
+    return PrintProducer(node.as<DataProducerNode>());
   } else if (node->IsInstance<StringObj>()) {
     return PrintString(node.as<StringObj>());
   } else if (node->IsInstance<BufferRegionNode>()) {
     return PrintBufferRegion(node.as<BufferRegionNode>());
+  } else if (node->IsInstance<TargetNode>()) {
+    return Doc::Text(node.as<TargetNode>()->ToDebugString());
   } else {
     return this->meta_->GetMetaNode(node);
   }
@@ -198,6 +204,19 @@ Doc TIRTextPrinter::PrintBuffer(const BufferNode* op) {
   }
 }
 
+Doc TIRTextPrinter::PrintProducer(const DataProducerNode* op) {
+  const DataProducer& prod = GetRef<DataProducer>(op);
+
+  if (meta_->InMeta(prod)) {
+    return meta_->GetMetaNode(prod);
+  } else if (memo_producer_.count(prod)) {
+    return memo_producer_[prod];
+  } else {
+    memo_producer_[prod] = AllocProducer(prod);
+    return DataProducerNode2Doc(op, memo_producer_[prod]);
+  }
+}
+
 Doc TIRTextPrinter::BufferNode2Doc(const BufferNode* buf, Doc doc) {
   doc << Doc::Text(": Buffer(") << Print(buf->data) << ", " << PrintDType(buf->dtype) << ", "
       << Print(buf->shape) << ", " << Print(buf->strides);
@@ -217,6 +236,11 @@ Doc TIRTextPrinter::BufferNode2Doc(const BufferNode* buf, Doc doc) {
     doc << ", type=" << Doc::StrLiteral("auto");
   }
   return doc << ")";
+}
+
+Doc TIRTextPrinter::DataProducerNode2Doc(const DataProducerNode* prod, Doc doc) {
+  return doc << Doc::Text(": DataProducer(") << Print(prod->GetNameHint()) << ", "
+             << PrintDType(prod->GetDataType()) << ", " << Print(prod->GetShape()) << ")";
 }
 
 Doc TIRTextPrinter::PrintBufferRegion(const BufferRegionNode* op) {
@@ -368,19 +392,32 @@ Doc TIRTextPrinter::VisitExpr_(const LetNode* op) {
 
 Doc TIRTextPrinter::VisitExpr_(const CallNode* op) {
   Doc doc;
+  std::vector<Doc> func_args;
   if (auto* ptr_op = op->op.as<OpNode>()) {
     doc << "@" << Doc::Text(ptr_op->name) << "(";
+    if (ptr_op->name == "tir.call_llvm_pure_intrin") {
+      auto f = tvm::runtime::Registry::Get("target.llvm_get_intrinsic_name");
+      ICHECK(f != nullptr)
+          << "Cannot find target.llvm_get_intrinsic_name. Compile with USE_LLVM=On";
+      func_args.push_back(Print((*f)(Downcast<IntImm>(op->args[0])->value)));
+      for (size_t i = 1; i < op->args.size(); i++) {
+        func_args.push_back(Print(op->args[i]));
+      }
+    } else {
+      for (const auto& arg : op->args) {
+        func_args.push_back(Print(arg));
+      }
+    }
   } else {
     // TODO(bohan): Print out the name by he global var in the module.
     auto* op_gvar = op->op.as<GlobalVarNode>();
     ICHECK(op_gvar != nullptr);
     doc << "@" << Doc::Text(op_gvar->name_hint) << "(";
+    for (const auto& arg : op->args) {
+      func_args.push_back(Print(arg));
+    }
   }
-  std::vector<Doc> args;
-  for (const auto& arg : op->args) {
-    args.push_back(Print(arg));
-  }
-  doc << PrintSep(args, Doc::Text(", ")) << ", dtype=" << PrintDType(op->dtype) << ")";
+  doc << PrintSep(func_args, Doc::Text(", ")) << ", dtype=" << PrintDType(op->dtype) << ")";
   return doc;
 }
 
@@ -438,6 +475,12 @@ Doc TIRTextPrinter::VisitStmt_(const BufferStoreNode* op) {
   return doc;
 }
 
+Doc TIRTextPrinter::VisitStmt_(const ProducerStoreNode* op) {
+  Doc doc;
+  doc << Print(op->producer) << Print(op->indices) << " = " << Print(op->value);
+  return doc;
+}
+
 Doc TIRTextPrinter::VisitStmt_(const BufferRealizeNode* op) {
   Doc doc;
   doc << "realize(" << Print(op->buffer) << ", " << Print(op->bounds) << ", "
@@ -445,10 +488,26 @@ Doc TIRTextPrinter::VisitStmt_(const BufferRealizeNode* op) {
   return doc;
 }
 
+Doc TIRTextPrinter::VisitStmt_(const ProducerRealizeNode* op) {
+  Doc doc;
+  doc << "producer_realize(" << Print(op->producer) << ", " << Print(op->bounds) << ", "
+      << Print(op->condition) << ", " << PrintBody(op->body) << ")";
+  return doc;
+}
+
 Doc TIRTextPrinter::VisitStmt_(const AllocateNode* op) {
   Doc doc;
-  doc << "allocate(" << Print(op->buffer_var) << ", " << PrintDType(op->dtype) << ", "
-      << Print(op->extents) << ")";
+  auto scope = GetPtrStorageScope(op->buffer_var);
+  doc << "allocate(" << Print(op->buffer_var) << ", ";
+  doc << PrintDType(op->dtype) << ", ";
+  doc << Print(op->extents) << "), storage_scope = " << scope;
+  if (!op->annotations.empty()) {
+    std::vector<Doc> attr_docs;
+    for (const auto& it : op->annotations) {
+      attr_docs.push_back(Doc::StrLiteral(it.first) << ": " << Print(it.second));
+    }
+    doc << ", annotations = {" << PrintSep(attr_docs, Doc::Text(", ")) << "})";
+  }
   if (!is_one(op->condition)) {
     doc << " if " << Print(op->condition);
   }
@@ -483,23 +542,6 @@ Doc TIRTextPrinter::VisitStmt_(const EvaluateNode* op) {
   Doc doc;
   doc << Print(op->value);
   return doc;
-}
-
-inline const char* ForKind2String(ForKind t) {
-  switch (t) {
-    case ForKind::kSerial:
-      return "serial";
-    case ForKind::kParallel:
-      return "parallel";
-    case ForKind::kVectorized:
-      return "vectorized";
-    case ForKind::kUnrolled:
-      return "unroll";
-    case ForKind::kThreadBinding:
-      return "thread_binding";
-  }
-  LOG(FATAL) << "Unknown ForKind";
-  return "Unknown";
 }
 
 Doc TIRTextPrinter::VisitStmt_(const ForNode* op) {
@@ -598,8 +640,8 @@ Doc TIRTextPrinter::VisitStmt_(const BlockRealizeNode* op) {
          << Print(alloc_buf->shape) << ")" << Doc::NewLine();
   }
   for (const auto& match_buf : block_op->match_buffers) {
-    body << AllocBuf(match_buf->buffer) << " = match_buffer_region(" << Print(match_buf->source)
-         << ")" << Doc::NewLine();
+    body << AllocBuf(match_buf->buffer) << " = match_buffer(" << Print(match_buf->source) << ")"
+         << Doc::NewLine();
   }
   if (block_op->init.defined()) {
     Doc init_block;
@@ -713,6 +755,20 @@ Doc TIRTextPrinter::AllocBuf(const Buffer& buffer) {
   }
   Doc val = GetUniqueName(name);
   memo_buf_[buffer] = val;
+  return val;
+}
+
+Doc TIRTextPrinter::AllocProducer(const DataProducer& producer) {
+  const auto& it = memo_producer_.find(producer);
+  if (it != memo_producer_.end()) {
+    return it->second;
+  }
+  std::string name = producer->GetNameHint();
+  if (name.length() == 0 || !std::isalpha(name[0])) {
+    name = "tensor_" + name;
+  }
+  Doc val = GetUniqueName(name);
+  memo_producer_[producer] = val;
   return val;
 }
 

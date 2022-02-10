@@ -188,6 +188,58 @@ class LinkedParam : public ObjectRef {
 };
 
 /*!
+ * \brief Tensor intrinsics for tensorization
+ */
+class TensorIntrinNode : public Object {
+ public:
+  /*! \brief The function to describe the computation. */
+  PrimFunc desc;
+  /*! \brief The function of the implementation for the execution. */
+  PrimFunc impl;
+
+  void VisitAttrs(AttrVisitor* v) {
+    v->Visit("desc", &desc);
+    v->Visit("impl", &impl);
+  }
+
+  static constexpr const char* _type_key = "tir.TensorIntrin";
+  TVM_DECLARE_FINAL_OBJECT_INFO(TensorIntrinNode, Object);
+};
+
+/*!
+ * \brief Managed reference to TensorIntrinNode.
+ */
+class TensorIntrin : public ObjectRef {
+ public:
+  /*!
+   * \brief Constructor
+   * \param desc The function to describe the computation.
+   * \param impl The function of the implementation for the execution.
+   */
+  TVM_DLL explicit TensorIntrin(PrimFunc desc, PrimFunc impl);
+
+  /*!
+   * \brief Create and register a TensorIntrin. After registration, the TensorIntrin can be looked
+   * up with its name.
+   * \param name The name of the TensorIntrin to register
+   * \param intrin The TensorIntrin to register.
+   * \throws This method throws an exception if the TensorIntrin with the specified name already
+   *         exists.
+   */
+  TVM_DLL static void Register(String name, TensorIntrin intrin);
+
+  /*!
+   * \brief Look up TensorIntrin by name. Raises an exception if not found.
+   * \param name The name of the TensorIntrin.
+   * \return The TensorIntrin with the specified name.
+   * \throws This method throws an exception if the TensorIntrin does not exist.
+   */
+  TVM_DLL static TensorIntrin Get(String name);
+
+  TVM_DEFINE_OBJECT_REF_METHODS(TensorIntrin, ObjectRef, TensorIntrinNode)
+};
+
+/*!
  * \brief Specialize parameters of PrimFunc.
  * \param func The PrimFunc to be specialized.
  * \param param_map The mapping from function params to the instance.
@@ -195,13 +247,14 @@ class LinkedParam : public ObjectRef {
  * \note We can define a Meta TIR function with symbolic shape:
  *
  * \code
- *  @tvm.script.tir
- *  def mem_copy(a: ty.handle, b: ty.handle, m: ty.int32, n: ty.int32) -> None:
- *      A = tir.match_buffer(a, (m, n), "float32")
- *      B = tir.match_buffer(b, (m, n), "float32")
- *
- *      with tir.block([m, n], "") as [vi, vj]:
- *          B[vi, vj] = A[vi, vj]
+ *  @T.prim_func
+ *  def mem_copy(a: T.handle, b: T.handle, m: T.int32, n: T.int32) -> None:
+ *      A = T.match_buffer(a, (m, n), "float32")
+ *      B = T.match_buffer(b, (m, n), "float32")
+ *      for i, j in T.grid(m, n):
+ *          with T.block():
+ *              vi, vj = T.axis.remap("SS", [i, j])
+ *              B[vi, vj] = A[vi, vj]
  * \endcode
  *
  * Then we can make it specialized with given shapes or buffers.
@@ -214,13 +267,14 @@ class LinkedParam : public ObjectRef {
  * \endcode
  *
  * \code {.language-id}
- *  @tvm.script.tir
- *  def mem_copy_16_16(a: ty.handle, b: ty.handle) -> None:
- *      A = tir.match_buffer(a, (16, 16), "float32")
- *      B = tir.match_buffer(b, (16, 16), "float32")
- *
- *      with tir.block([16, 16], "") as [vi, vj]:
- *          B[vi, vj] = A[vi, vj]
+ *  @T.prim_func
+ *  def mem_copy_16_16(a: T.handle, b: T.handle) -> None:
+ *      A = T.match_buffer(a, (16, 16), "float32")
+ *      B = T.match_buffer(b, (16, 16), "float32")
+ *      for i, j in T.grid(16, 16):
+ *          with T.block():
+ *              vi, vj = T.axis.remap("SS", [i, j])
+ *              B[vi, vj] = A[vi, vj]
  * \endcode
  */
 PrimFunc Specialize(PrimFunc func, const Map<Var, ObjectRef>& param_map);
@@ -240,9 +294,11 @@ namespace attr {
  *
  * Call(f,
  *      [arg1, arg2, ..., arg_n,
- *       work_size_1, work_size_2, ... work_size_m])
+ *       work_size_1, work_size_2, ... work_size_m, dyn_shmem_size])
  *
  * Here n = len(arg), m = len(work_size) = len(device_thread_axis).
+ *
+ * When kDeviceUseDynSharedMemory is not set, dyn_shmem_size argument is omitted.
  *
  * The list of device_thread_axis indicates how can be bind the
  * work_size arguments to the corresponding threads.
@@ -250,6 +306,13 @@ namespace attr {
  * \sa tvm::CallingConv::kDeviceKernelLaunch
  */
 constexpr const char* kDeviceThreadAxis = "tir.device_thread_axis";
+
+/*!
+ * \brief Whether or not use dynamic shared memory.
+ *
+ * Type: Integer
+ */
+constexpr const char* kDeviceUseDynSharedMemory = "tir.device_use_dyn_shared_memory";
 
 /*!
  * \brief Whether to set noalias rule on the function arguments.
@@ -277,6 +340,13 @@ constexpr const char* kIsEntryFunc = "tir.is_entry_func";
  *     tvm::target::packed_func::kLookupLinkedParam.
  */
 constexpr const char* kLinkedParams = "tir.linked_params";
+
+/*!
+ * \brief Mark the function as the global function called from the host.
+ *
+ * Type: Integer
+ */
+constexpr const char* kIsGlobalFunc = "tir.is_global_func";
 
 }  // namespace attr
 }  // namespace tir
