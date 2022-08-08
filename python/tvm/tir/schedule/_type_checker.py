@@ -17,7 +17,7 @@
 """Type checking functionality"""
 import functools
 import inspect
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 import typing
 
 
@@ -42,6 +42,20 @@ if hasattr(typing, "_GenericAlias"):
             return None
 
         @staticmethod
+        def dict_(type_: Any) -> Any:
+            if _Subtype._origin(type_) is dict:
+                (ktype, vtype) = type_.__args__
+                return [ktype, vtype]
+            return None
+
+        @staticmethod
+        def tuple_(type_: Any) -> Optional[List[type]]:
+            if _Subtype._origin(type_) is tuple:
+                subtypes = type_.__args__
+                return subtypes
+            return None
+
+        @staticmethod
         def optional(type_: Any) -> Optional[List[type]]:
             if _Subtype._origin(type_) is Union:
                 subtypes = type_.__args__
@@ -57,7 +71,6 @@ if hasattr(typing, "_GenericAlias"):
                     return list(subtypes)
             return None
 
-
 elif hasattr(typing, "_Union"):
 
     class _Subtype:  # type: ignore
@@ -67,6 +80,22 @@ elif hasattr(typing, "_Union"):
                 if type_.__name__ == "List":
                     (subtype,) = type_.__args__  # type: ignore # pylint: disable=no-member
                     return [subtype]
+            return None
+
+        @staticmethod
+        def dict_(type_: Any) -> Optional[List[type]]:
+            if isinstance(type_, typing.GenericMeta):  # type: ignore # pylint: disable=no-member
+                if type_.__name__ == "Dict":
+                    (ktype, vtype) = type_.__args__  # type: ignore # pylint: disable=no-member
+                    return [ktype, vtype]
+            return None
+
+        @staticmethod
+        def tuple_(type_: Any) -> Optional[List[type]]:
+            if isinstance(type_, typing.GenericMeta):  # type: ignore # pylint: disable=no-member
+                if type_.__name__ == "Tuple":
+                    subtypes = type_.__args__  # type: ignore # pylint: disable=no-member
+                    return subtypes
             return None
 
         @staticmethod
@@ -94,6 +123,14 @@ def _dispatcher(type_: Any) -> Tuple[str, List[type]]:
     if subtype is not None:
         return "list", subtype
 
+    subtype = _Subtype.dict_(type_)
+    if subtype is not None:
+        return "dict", subtype
+
+    subtype = _Subtype.tuple_(type_)
+    if subtype is not None:
+        return "tuple", subtype
+
     subtype = _Subtype.optional(type_)
     if subtype is not None:
         return "optional", subtype
@@ -109,6 +146,8 @@ _TYPE2STR: Dict[Any, Callable] = {
     "none": lambda: "None",
     "atomic": lambda t: str(t.__name__),
     "list": lambda t: f"List[{_type2str(t)}]",
+    "dict": lambda k, v: f"Dict[{_type2str(k)}, {_type2str(v)}]",
+    "tuple": lambda *t: f"Tuple[{', '.join([_type2str(x) for x in t])}]",
     "optional": lambda t: f"Optional[{_type2str(t)}]",
     "union": lambda *t: f"Union[{', '.join([_type2str(x) for x in t])}]",
 }
@@ -119,11 +158,26 @@ def _type2str(type_: Any) -> str:
     return _TYPE2STR[key](*subtypes)
 
 
+def _val2type(value: Any):
+    if isinstance(value, list):
+        types = set(_val2type(x) for x in value)
+        if len(types) == 1:
+            return List[types.pop()]  # type: ignore
+
+        return List[Union[tuple(types)]]  # type: ignore
+
+    if isinstance(value, tuple):
+        types = tuple(_val2type(x) for x in value)  # type: ignore
+        return Tuple[types]
+
+    return type(value)
+
+
 def _type_check_err(x: Any, name: str, expected: Any) -> str:
     return (
         f'"{name}" has wrong type. '
         f'Expected "{_type2str(expected)}", '
-        f'but gets: "{_type2str(type(x))}"'
+        f'but gets: "{_type2str(_val2type(x))}"'
     )
 
 
@@ -143,6 +197,30 @@ def _type_check_vtable() -> Dict[str, Callable]:
                 return error_msg
         return None
 
+    def _type_check_dict(dict_obj: Dict[Any, Any], name: str, *types: Any) -> Optional[str]:
+        ktype_, vtype_ = types
+        if not isinstance(dict_obj, dict):
+            return _type_check_err(dict_obj, name, dict)
+        for k, v in dict_obj.items():
+            error_msg = _type_check(k, f"{name}[{k}]", ktype_)
+            if error_msg is not None:
+                return error_msg
+            error_msg = _type_check(v, f"{name}[{k}]", vtype_)
+            if error_msg is not None:
+                return error_msg
+        return None
+
+    def _type_check_tuple(v: Any, name: str, *types: Any) -> Optional[str]:
+        if not isinstance(v, tuple):
+            return _type_check_err(v, name, Tuple[types])
+        if len(types) != len(v):
+            return _type_check_err(v, name, Tuple[types])
+        for i, (x, type_) in enumerate(zip(v, types)):
+            error_msg = _type_check(x, f"{name}[{i}]", type_)
+            if error_msg is not None:
+                return error_msg
+        return None
+
     def _type_check_optional(v: Any, name: str, type_: Any) -> Optional[str]:
         return None if v is None else _type_check(v, name, type_)
 
@@ -151,12 +229,14 @@ def _type_check_vtable() -> Dict[str, Callable]:
             error_msg = _type_check(v, name, type_)
             if error_msg is None:
                 return None
-        return _type_check_err(v, name, types)
+        return _type_check_err(v, name, Union[types])
 
     return {
         "none": _type_check_none,
         "atomic": _type_check_atomic,
         "list": _type_check_list,
+        "dict": _type_check_dict,
+        "tuple": _type_check_tuple,
         "optional": _type_check_optional,
         "union": _type_check_union,
     }
@@ -170,7 +250,10 @@ def _type_check(v: Any, name: str, type_: Any) -> Optional[str]:
     return _TYPE_CHECK[key](v, name, *subtypes)
 
 
-def type_checked(func: Callable) -> Callable:
+FType = TypeVar("FType", bound=Callable[..., Any])
+
+
+def type_checked(func: FType) -> FType:
     """Type check the input arguments of a function."""
     sig = inspect.signature(func)
 
@@ -190,4 +273,4 @@ def type_checked(func: Callable) -> Callable:
                     raise TypeError(error_msg)
         return func(*args, **kwargs)
 
-    return wrap
+    return wrap  # type: ignore

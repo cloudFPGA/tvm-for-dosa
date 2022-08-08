@@ -114,11 +114,20 @@ class EthosUModuleNode : public ModuleNode {
     return PackedFunc();
   }
 
-  const char* type_key() const override { return "c"; }
+  const char* type_key() const final { return "c"; }
 
   static Module Create(Array<CompilationArtifact> compilation_artifacts) {
     auto n = make_object<EthosUModuleNode>(compilation_artifacts);
     return Module(n);
+  }
+
+  bool IsDSOExportable() const final { return true; }
+
+  bool ImplementsFunction(const String& name, bool query_imports) final {
+    return std::find_if(compilation_artifacts_.begin(), compilation_artifacts_.end(),
+                        [&name](const CompilationArtifact& artifact) {
+                          return artifact->function_name == name;
+                        }) != compilation_artifacts_.end();
   }
 
  private:
@@ -190,7 +199,7 @@ class EthosUModuleNode : public ModuleNode {
     std::unordered_map<int, relay::contrib::ethosu::BaseAddress> param_idx_to_base_address;
     for (const relay::contrib::ethosu::BaseAddress& base_address : artifact->base_addresses) {
       if (base_address->primfunc_param_idx.defined()) {
-        param_idx_to_base_address[base_address->primfunc_param_idx] = base_address;
+        param_idx_to_base_address[base_address->primfunc_param_idx.IntValue()] = base_address;
       }
     }
     for (unsigned int i = 0; i < param_idx_to_base_address.size(); i++) {
@@ -250,8 +259,6 @@ class EthosUModuleNode : public ModuleNode {
     PrintExternCPrefix(ss);
     PrintRuntimeFunctionSignature(ss, compilation_artifact, func_no_dashes);
     ss << "  void* cms_data = (void*)(" << func_no_dashes << "_cms_data_data);\n";
-    ss << "  int64_t device_type = kDLCPU;\n";
-    ss << "  int64_t device_id = 0;\n";
     ss << "  const size_t cms_data_size = sizeof(" << func_no_dashes << "_cms_data_data);\n";
     ss << "  size_t base_addrs_size[" << kMaxBaseAddresses_ << "] = {0};\n";
     ss << "  uint64_t base_addrs[" << kMaxBaseAddresses_ << "] = {0};\n";
@@ -262,9 +269,8 @@ class EthosUModuleNode : public ModuleNode {
          compilation_artifact->base_addresses) {
       if (base_address->is_runtime_allocation) {
         ss << "  int8_t* " << base_address->name
-           << " = (int8_t*) TVMBackendAllocWorkspace(device_type, device_id, "
-              "(uint64_t)"
-           << base_address->size << ", 0, 16);\n";
+           << " = (int8_t*) TVMBackendAllocWorkspace(kDLCPU, 0, (uint64_t)" << base_address->size
+           << ", 0, 16);\n";
       }
       ss << SetBaseAddress(base_address->region->value, base_address->name.c_str(),
                            base_address->size->value);
@@ -278,7 +284,7 @@ class EthosUModuleNode : public ModuleNode {
     for (const relay::contrib::ethosu::BaseAddress& base_address :
          compilation_artifact->base_addresses) {
       if (base_address->is_runtime_allocation) {
-        ss << "  TVMBackendFreeWorkspace(device_type, device_id, " << base_address->name << ");\n";
+        ss << "  TVMBackendFreeWorkspace(kDLCPU, 0, " << base_address->name << ");\n";
       }
     }
     ss << "  return result;\n";

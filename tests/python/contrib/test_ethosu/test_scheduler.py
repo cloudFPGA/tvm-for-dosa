@@ -34,7 +34,7 @@ from tvm.relay.backend.contrib.ethosu.tir.scheduler import (
 from tvm.relay.backend.contrib.ethosu.tir.compiler import (
     lower_to_te,
     extract_constants,
-    lower_to_tir,
+    _lower_to_tir,
 )
 from .infra import (
     AttachType,
@@ -180,25 +180,19 @@ def test_schedule_cache_reads():
 @tvm.script.ir_module
 class DiamondGraphTir:
     @T.prim_func
-    def main(input_buffer: T.Buffer[(1, 56, 56, 96), "int8"], output_buffer: T.Buffer[(1, 56, 56, 24), "int8"]) -> None:
+    def main(placeholder: T.Buffer[(301056,), "int8"], ethosu_write: T.Buffer[(75264,), "int8"]) -> None:
         T.func_attr({"from_legacy_te_schedule": True, "global_symbol": "main", "tir.noalias": True})
-        weight_buffer = T.buffer_var("uint8", "")
-        bias_buffer = T.buffer_var("uint8", "")
-        weight_buffer2 = T.buffer_var("uint8", "")
-        bias_buffer2 = T.buffer_var("uint8", "")
-
-        placeholder_global = T.allocate([2608], "uint8", "global", annotations={"disable_lower_builtin":True})
-        placeholder_d_global = T.allocate([240], "uint8", "global", annotations={"disable_lower_builtin":True})
-        featuremap_buffer = T.allocate([75264], "int8", "global", annotations={"disable_lower_builtin": True})
-        featuremap_buffer2 = T.allocate([75264], "int8", "global", annotations={"disable_lower_builtin": True})
-
-        T.evaluate(T.call_extern("ethosu_copy", T.load("uint8", weight_buffer, 0), 2608, T.load("uint8", placeholder_global, 0), dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_copy", T.load("uint8", bias_buffer, 0), 240, T.load("uint8", placeholder_d_global, 0), dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_conv2d", "int8", 56, 56, 96, 56, 0, 56, T.load("int8", input_buffer.data, 0), 0, 0, 0, T.float32(0.5), 10, "NHWC", 5376, 96, 1, "int8", 56, 56, 24, 56, 0, 56, T.load("int8", featuremap_buffer, 0), 0, 0, 0, T.float32(0.25), 14, "NHWC", 1344, 24, 1, 1, 1, 1, 1, 1, 1, T.load("uint8", placeholder_global, 0), 2608, 12, T.load("uint8", placeholder_d_global, 0), 240, 0, 0, 0, 0, "NONE", 0, 0, "TFL", "NONE", dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_copy", T.load("uint8", weight_buffer2, 0), 736, T.load("uint8", placeholder_global, 0), dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_copy", T.load("uint8", bias_buffer2, 0), 240, T.load("uint8", placeholder_d_global, 0), dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_conv2d", "int8", 56, 56, 24, 56, 0, 56, T.load("int8", featuremap_buffer, 0), 0, 0, 0, T.float32(0.5), 10, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, T.load("int8", featuremap_buffer2, 0), 0, 0, 0, T.float32(0.25), 14, "NHWC", 1344, 24, 1, 1, 1, 1, 1, 1, 1, T.load("uint8", placeholder_global, 0), 736, 12, T.load("uint8", placeholder_d_global, 0), 240, 0, 0, 0, 0, "NONE", 0, 0, "TFL", "NONE", dtype="handle"))
-        T.evaluate(T.call_extern("ethosu_binary_elementwise", "int8", 56, 56, 24, 56, 0, 56, T.load("int8", featuremap_buffer, 0), 0, 0, 0, T.float32(1), 0, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, T.load("int8", featuremap_buffer2, 0), 0, 0, 0, T.float32(1), 0, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, T.load("int8", output_buffer.data, 0), 0, 0, 0, T.float32(1), 0, "NHWC", 1344, 24, 1, "ADD", 0, "NONE", 0, 0, "TFL", dtype="handle"))
+        buffer1 = T.buffer_decl([2848], "uint8")
+        buffer3 = T.buffer_decl([976], "uint8")
+        p1 = T.allocate([2848], "uint8", "global", annotations={"disable_lower_builtin":True})
+        p2 = T.allocate([976], "uint8", "global", annotations={"disable_lower_builtin":True})
+        p5 = T.allocate([75264], "int8", "global", annotations={"disable_lower_builtin":True})
+        p6 = T.allocate([75264], "int8", "global", annotations={"disable_lower_builtin":True})
+        T.evaluate(T.call_extern("ethosu_copy", buffer1[0], 2848, p1[0], dtype="handle"))
+        T.evaluate(T.call_extern("ethosu_copy", buffer3[0], 976, p2[0], dtype="handle"))
+        T.evaluate(T.call_extern("ethosu_conv2d", "int8", 56, 56, 96, 56, 0, 56, placeholder[0], 0, 0, 0, T.float32(0.5), 10, "NHWC", 5376, 96, 1, "int8", 56, 56, 24, 56, 0, 56, p5[0], 0, 0, 0, T.float32(0.25), 14, "NHWC", 1344, 24, 1, 1, 1, 1, 1, 1, 1, p1[0], 2608, T.int8(-1), T.int8(-1), 12, p1[2608], 240, T.int8(-1), T.int8(-1), 0, 0, 0, 0, "NONE", 0, 0, "TFL", "NONE", 0, 0, 0, dtype="handle"))
+        T.evaluate(T.call_extern("ethosu_conv2d", "int8", 56, 56, 24, 56, 0, 56, p5[0], 0, 0, 0, T.float32(0.5), 10, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, p6[0], 0, 0, 0, T.float32(0.25), 14, "NHWC", 1344, 24, 1, 1, 1, 1, 1, 1, 1, p2[0], 736, T.int8(-1), T.int8(-1), 12, p2[736], 240, T.int8(-1), T.int8(-1), 0, 0, 0, 0, "NONE", 0, 0, "TFL", "NONE", 0, 0, 0, dtype="handle"))
+        T.evaluate(T.call_extern("ethosu_binary_elementwise", "int8", 56, 56, 24, 56, 0, 56, p5[0], 0, 0, 0,T.float32(1), 0, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, p6[0], 0, 0, 0, T.float32(1), 0, "NHWC", 1344, 24, 1, "int8", 56, 56, 24, 56, 0, 56, ethosu_write[0], 0, 0, 0, T.float32(1), 0, "NHWC", 1344, 24, 1, "ADD", 0, "NONE", 0, 0, "TFL", 0, 0, 0, dtype="handle"))
     __tvm_meta__ = None
 # fmt: on
 
@@ -212,9 +206,8 @@ def test_schedule_diamond_graph():
     func = relay.Function(relay.analysis.free_vars(add), add)
     func = run_opt_pass(func, relay.transform.InferType())
 
-    test_mod, _ = lower_to_tir(func, copy_constants())
+    test_mod, _ = _lower_to_tir(func, copy_constants())
     reference_mod = DiamondGraphTir
-
     tvm.ir.assert_structural_equal(test_mod["main"], reference_mod["main"], True)
 
 

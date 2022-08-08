@@ -33,19 +33,20 @@ import tvm
 from tvm import relay
 from tvm.relay.op.contrib.ethosu import partition_for_ethosu
 from tvm.relay.backend.contrib.ethosu.codegen import LayoutOptimizer
-from tvm.relay.backend.contrib.ethosu.codegen import relay_to_tir_func
+from tvm.relay.backend.contrib.ethosu.codegen import relay_to_tir
 
 from . import infra
 
 
-def _optimize(expr, optimize=True):
+def _optimize(func, optimize=True):
     """Create IRModule and run layout optimizer pass."""
-    mod = tvm.IRModule.from_expr(expr)
+    func = func.with_attr("Compiler", "ethos-u")
+    mod = tvm.IRModule.from_expr(func)
     mod = relay.transform.InferType()(mod)
     if optimize:
         mod = LayoutOptimizer()(mod)
     entry = mod["main"]
-    return entry if isinstance(expr, relay.Function) else entry.body
+    return entry if isinstance(func, relay.Function) else entry.body
 
 
 def _assert_structural_equal(a, b):
@@ -75,11 +76,12 @@ def _compile_and_compare_model(tflite_graph, ifm_shape, dtype):
     # Generate reference data
     input_data, output_data = infra.generate_ref_data_tflite(tflite_graph)
 
+    test_runner = infra.create_test_runner("ethos-u55-256")
     compiled_models = infra.build_source(
         mod,
         input_data,
         output_data,
-        "ethos-u55-256",
+        test_runner,
         output_tolerance=0,
     )
 
@@ -91,7 +93,7 @@ def _compile_and_compare_model(tflite_graph, ifm_shape, dtype):
     compilation_artifacts = get_artifacts(ethosu_module)
     cmms = bytes.fromhex(compilation_artifacts[0].command_stream)
     infra.print_payload(cmms)
-    infra.verify_source(compiled_models, "ethos-u55-256")
+    infra.verify_source(compiled_models, test_runner)
 
 
 def test_single_convolution():
@@ -721,10 +723,10 @@ def test_layout_optimizer_runs_in_compilation_pipeline():
 
     mod = get_graph()
     mod = partition_for_ethosu(mod)
+    mod = relay_to_tir(mod)
 
     external_gv_name = mod["main"].body.op.name_hint
-    external_func = mod[external_gv_name]
-    prim_func = relay_to_tir_func(external_func)
+    prim_func = mod[external_gv_name]
 
     # Check for hints in the TIR prim func that the layout optimization pass has ran
     ops = prim_func.body.body.seq

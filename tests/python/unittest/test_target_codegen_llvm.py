@@ -51,7 +51,7 @@ def test_llvm_void_intrin():
     ib = tvm.tir.ir_builder.create()
     A = ib.pointer("uint8", name="A")
     # Create an intrinsic that returns void.
-    x = tvm.tir.call_llvm_intrin("", "llvm.va_start", tvm.tir.const(1, "uint32"), A)
+    x = tvm.tir.call_llvm_intrin("", "llvm.va_start", tvm.tir.const(1, "uint32"), A.asobject().data)
     ib.emit(x)
     body = ib.get()
     mod = tvm.IRModule.from_expr(tvm.tir.PrimFunc([A], body).with_attr("global_symbol", "main"))
@@ -672,13 +672,12 @@ def test_llvm_shuffle():
         def vectorizer(op):
             store = op.body
             idx = tvm.tir.Ramp(tvm.tir.const(0, "int32"), tvm.tir.const(1, "int32"), 8)
-            all_ones = tvm.tir.const(1, "int32x8")
             value = store.value
             b_idx = tvm.tir.Shuffle([idx], [tvm.tir.const(i, "int32") for i in range(7, -1, -1)])
-            new_a = tvm.tir.Load("int32x8", value.a.buffer_var, idx, all_ones)
-            new_b = tvm.tir.Load("int32x8", value.b.buffer_var, b_idx, all_ones)
+            new_a = tvm.tir.BufferLoad(value.a.buffer, [idx])
+            new_b = tvm.tir.BufferLoad(value.b.buffer, [b_idx])
             value = new_a + new_b
-            return tvm.tir.Store(store.buffer_var, new_a + new_b, idx, all_ones)
+            return tvm.tir.BufferStore(store.buffer, new_a + new_b, [idx])
 
         def _transform(f, *_):
             return f.with_body(
@@ -861,6 +860,7 @@ def test_llvm_order_functions():
 
 
 @tvm.testing.requires_llvm
+@tvm.testing.skip_if_32bit
 def test_llvm_import():
     """all-platform-minimal-test: check shell dependent clang behavior."""
     # extern "C" is necessary to get the correct signature
@@ -925,7 +925,7 @@ def test_raise_exception_during_codegen():
         T.func_attr({"global_symbol": "main", "tir.noalias": True})
         for i in T.parallel(4):
             for j in T.parallel(4):
-                T.store(B.data, i * 4 + j, T.load("float32", A.data, i * 4 + j) * 2.0)
+                B[i, j] = A[i, j] * 2.0
 
     with pytest.raises(tvm.TVMError) as e:
         tvm.build({"llvm": tvm.IRModule.from_expr(threadpool_nested_parallel_loop)})
@@ -933,5 +933,50 @@ def test_raise_exception_during_codegen():
     assert msg.find("Nested parallel loop is not supported") != -1
 
 
+@tvm.testing.requires_llvm
+def test_llvm_target_attributes():
+    """Check that when LLVM codegen creates new functions, they get the same target
+    attributes as the original function.
+    """
+    n = te.var()
+    A = te.placeholder((n,), name="A", dtype="float32")
+    B = te.compute((n,), lambda i: A[i], name="B")
+    C = te.compute((n,), lambda i: B[i] + tvm.tir.const(1, A.dtype), name="C")
+    s = te.create_schedule(C.op)
+    xo, xi = s[C].split(C.op.axis[0], nparts=2)
+    s[C].parallel(xo)
+
+    target_llvm = "llvm -mcpu=skylake -mattr=+avx512f"
+    target = tvm.target.Target(target_llvm, host=target_llvm)
+    module = tvm.build(s, [A, B, C, n], target=target, name="test_func")
+
+    llvm_ir = module.get_source()
+    llvm_ir_lines = llvm_ir.split("\n")
+
+    attribute_definitions = dict()
+    attributes_with_target = dict()
+    functions_with_target = []
+
+    for line in llvm_ir_lines:
+        func_def = re.match(
+            "define.* @(?P<func_name>[^(]*)[(].* #(?P<attr_num>[0-9]+) (!.* |){$", line
+        )
+        if func_def:
+            functions_with_target.append(func_def.group("func_name"))
+            attributes_with_target[func_def.group("attr_num")] = True
+            continue
+        attr_def = re.match("attributes #(?P<attr_num>[0-9]+) = {(?P<attr_list>.*)}", line)
+        if attr_def:
+            attribute_definitions[attr_def.group("attr_num")] = attr_def.group("attr_list")
+
+    for k in list(attributes_with_target.keys()):
+        assert re.match('.*"target-cpu"="skylake".*', attribute_definitions[k])
+        assert re.match('.*"target-features"=".*[+]avx512f.*".*', attribute_definitions[k])
+
+    expected_functions = ["test_func", "test_func_compute_", "__tvm_parallel_lambda"]
+    for n in expected_functions:
+        assert n in functions_with_target
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

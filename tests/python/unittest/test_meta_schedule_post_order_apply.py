@@ -22,14 +22,16 @@ from typing import List
 
 import pytest
 import tvm
+import tvm.testing
+from tvm._ffi import register_func
 from tvm.error import TVMError
 from tvm.meta_schedule import TuneContext
 from tvm.meta_schedule.schedule_rule import PyScheduleRule
 from tvm.meta_schedule.space_generator import PostOrderApply
+from tvm.meta_schedule.utils import derived_object
 from tvm.script import tir as T
 from tvm.target import Target
 from tvm.tir.schedule import BlockRV, Schedule
-
 
 # pylint: disable=invalid-name,no-member,line-too-long,too-many-nested-blocks,no-self-argument,
 # fmt: off
@@ -120,6 +122,23 @@ class TrinityMatmulProcessedForReference:
                 D[vi, vj] = (B[vi, vj] + T.float32(3)) * T.float32(5)
 
 
+@tvm.script.ir_module
+class MatmulCustomized:
+    @T.prim_func
+    def main(a: T.handle, b: T.handle, c: T.handle) -> None:
+        T.func_attr({"global_symbol": "main"})
+        A = T.match_buffer(a, (1024, 1024), "float32")
+        B = T.match_buffer(b, (1024, 1024), "float32")
+        C = T.match_buffer(c, (1024, 1024), "float32")
+        with T.block("root"):
+            for i, j, k in T.grid(1024, 1024, 1024):
+                with T.block("matmul"):
+                    T.block_attr({"schedule_rule": "tvm.meta_schedule.test.custom_search_space"})
+                    vi, vj, vk = T.axis.remap("SSR", [i, j, k])
+                    with T.init():
+                        C[vi, vj] = 0.0
+                    C[vi, vj] = C[vi, vj] + A[vi, vk] * B[vk, vj]
+
 # fmt: on
 # pylint: enable=invalid-name,no-member,line-too-long,too-many-nested-blocks,no-self-argument
 
@@ -134,8 +153,9 @@ def _check_correct(schedule: Schedule):
         assert math.prod(trace.decisions[inst]) == 1024
 
 
+@derived_object
 class WowSoFancyScheduleRule(PyScheduleRule):
-    def initialize_with_tune_context(self, context: "TuneContext") -> None:
+    def _initialize_with_tune_context(self, context: "TuneContext") -> None:
         pass
 
     def apply(self, sch: Schedule, block: BlockRV) -> List[Schedule]:
@@ -150,8 +170,9 @@ class WowSoFancyScheduleRule(PyScheduleRule):
         return [new_sch]
 
 
+@derived_object
 class DoubleScheduleRule(PyScheduleRule):
-    def initialize_with_tune_context(self, context: "TuneContext") -> None:
+    def _initialize_with_tune_context(self, context: "TuneContext") -> None:
         pass
 
     def apply(self, sch: Schedule, block: BlockRV) -> List[Schedule]:
@@ -174,8 +195,9 @@ class DoubleScheduleRule(PyScheduleRule):
         return result
 
 
+@derived_object
 class ReorderScheduleRule(PyScheduleRule):
-    def initialize_with_tune_context(self, context: "TuneContext") -> None:
+    def _initialize_with_tune_context(self, context: "TuneContext") -> None:
         pass
 
     def apply(self, sch: Schedule, block: BlockRV) -> List[Schedule]:
@@ -198,10 +220,10 @@ def test_meta_schedule_post_order_apply():
         mod=mod,
         target=Target("llvm"),
         task_name="Test Task",
+        space_generator=PostOrderApply(),
         sch_rules=[WowSoFancyScheduleRule()],
     )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply = context.space_generator
     schs = post_order_apply.generate_design_space(mod)
     assert len(schs) == 1
     assert not tvm.ir.structural_equal(schs[0].mod, mod)
@@ -214,10 +236,10 @@ def test_meta_schedule_post_order_apply_double():
         mod=mod,
         target=Target("llvm"),
         task_name="Double Rules Task",
+        space_generator=PostOrderApply(),
         sch_rules=[DoubleScheduleRule()],
     )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply = context.space_generator
     schs = post_order_apply.generate_design_space(mod)
     assert len(schs) == 2
     for sch in schs:
@@ -231,10 +253,10 @@ def test_meta_schedule_post_order_apply_multiple():
         mod=mod,
         target=Target("llvm"),
         task_name="Double Rules Task",
+        space_generator=PostOrderApply(),
         sch_rules=[DoubleScheduleRule(), ReorderScheduleRule()],
     )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply = context.space_generator
     schs = post_order_apply.generate_design_space(mod)
     assert len(schs) == 4
     for sch in schs:
@@ -248,10 +270,10 @@ def test_meta_schedule_post_order_apply_duplicate_matmul():
         mod=mod,
         target=Target("llvm"),
         task_name="Duplicate Matmul Task",
+        space_generator=PostOrderApply(),
         sch_rules=[WowSoFancyScheduleRule()],
     )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply = context.space_generator
     with pytest.raises(
         TVMError,
         match=r".*TVMError: Check failed: \(block_names_.count\(block->name_hint\) == 0\)"
@@ -261,8 +283,9 @@ def test_meta_schedule_post_order_apply_duplicate_matmul():
 
 
 def test_meta_schedule_post_order_apply_remove_block():
+    @derived_object
     class TrinityDouble(PyScheduleRule):
-        def initialize_with_tune_context(self, context: "TuneContext") -> None:
+        def _initialize_with_tune_context(self, context: "TuneContext") -> None:
             pass
 
         def apply(self, sch: Schedule, block: BlockRV) -> List[Schedule]:
@@ -282,8 +305,9 @@ def test_meta_schedule_post_order_apply_remove_block():
             result.append(new_sch)
             return result
 
+    @derived_object
     class RemoveBlock(PyScheduleRule):
-        def initialize_with_tune_context(self, context: "TuneContext") -> None:
+        def _initialize_with_tune_context(self, context: "TuneContext") -> None:
             pass
 
         def apply(self, sch: Schedule, block: BlockRV) -> List[Schedule]:
@@ -302,12 +326,12 @@ def test_meta_schedule_post_order_apply_remove_block():
                 'b2 = sch.get_block(name="C", func_name="main")',
                 "sch.compute_inline(block=b1)",
                 "l3, l4 = sch.get_loops(block=b2)",
-                "l5, l6 = sch.split(loop=l3, factors=" + str(a) + ")",
-                "l7, l8 = sch.split(loop=l4, factors=" + str(b) + ")",
+                "l5, l6 = sch.split(loop=l3, factors=" + str(a) + ", preserve_unit_iters=True)",
+                "l7, l8 = sch.split(loop=l4, factors=" + str(b) + ", preserve_unit_iters=True)",
                 "sch.reorder(l5, l7, l6, l8)",
                 "l9, l10 = sch.get_loops(block=b0)",
-                "l11, l12 = sch.split(loop=l9, factors=" + str(c) + ")",
-                "l13, l14 = sch.split(loop=l10, factors=" + str(d) + ")",
+                "l11, l12 = sch.split(loop=l9, factors=" + str(c) + ", preserve_unit_iters=True)",
+                "l13, l14 = sch.split(loop=l10, factors=" + str(d) + ", preserve_unit_iters=True)",
                 "sch.reorder(l11, l13, l12, l14)",
             ]
         )
@@ -317,10 +341,10 @@ def test_meta_schedule_post_order_apply_remove_block():
         mod=mod,
         target=Target("llvm"),
         task_name="Remove Block Task",
+        space_generator=PostOrderApply(),
         sch_rules=[RemoveBlock(), TrinityDouble()],
     )
-    post_order_apply = PostOrderApply()
-    post_order_apply.initialize_with_tune_context(context)
+    post_order_apply = context.space_generator
     schs = post_order_apply.generate_design_space(mod)
     assert len(schs) == 4
     for sch in schs:
@@ -338,5 +362,28 @@ def test_meta_schedule_post_order_apply_remove_block():
         )
 
 
+def test_meta_schedule_custom_search_space():
+    mod = MatmulCustomized
+    context = TuneContext(
+        mod=mod,
+        target=Target("llvm"),
+        task_name="Custom Search Space Task",
+        space_generator=PostOrderApply(),
+        sch_rules=[],
+    )
+    post_order_apply = context.space_generator
+    post_order_apply.generate_design_space(mod)
+    called = False
+
+    def custom_search_space_func(sch: Schedule, _: BlockRV) -> List[Schedule]:
+        nonlocal called
+        called = True
+        return [sch]
+
+    register_func("tvm.meta_schedule.test.custom_search_space", custom_search_space_func)
+    post_order_apply.generate_design_space(mod)
+    assert called
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

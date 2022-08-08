@@ -54,7 +54,7 @@ struct VMFunction;
  *  used by the virtual machine.
  *  - Code section, handling the VM functions and bytecode.
  */
-class Executable : public ModuleNode {
+class TVM_DLL Executable : public ModuleNode {
  public:
   /*!
    * \brief Get a PackedFunc from an executable module.
@@ -217,6 +217,13 @@ class Executable : public ModuleNode {
    * to iterate on the way runtime::Module works in the backend of the compiler.
    */
   void SetLib(const runtime::Module& lib);
+
+  /*!
+   * \brief Get VMFunction.
+   * \param func_name The function's name.
+   * \return VMFunction.
+   */
+  const VMFunction& GetVMFunctionWithName(const std::string& func_name) const;
 
   /*!
    * \brief Get the arity of the VMFunction.

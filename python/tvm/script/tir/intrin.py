@@ -21,6 +21,7 @@ from typing import List, Any
 
 import tvm.tir
 from ..registry import register
+from ...target import codegen
 from ..utils import get_param_list, tvm_span_from_synr
 
 
@@ -102,6 +103,16 @@ def float64(imm, span):
 
 
 @register
+def int32x16(imm, span):
+    return imm.astype("int32x16", span)
+
+
+@register
+def int32x4(imm, span):
+    return imm.astype("int32x4", span)
+
+
+@register
 def min_value(dtype, span):
     return tvm.tir.min_value(dtype, span)
 
@@ -124,6 +135,11 @@ def floormod(x, y, span):
 @register
 def truncmod(x, y, span):
     return tvm.tir.truncmod(x, y, span)
+
+
+@register
+def ceildiv(x, y, span):
+    return tvm.tir.ceildiv(x, y, span)
 
 
 @register
@@ -202,6 +218,11 @@ def Select(cond, if_body, else_body, span):  # pylint: disable=invalid-name
 
 
 @register
+def Let(var, value, body, span):  # pylint: disable=invalid-name
+    return tvm.tir.Let(var, value, body, span)
+
+
+@register
 class EvaluateIntrin(Intrin):
     def __init__(self):
         def evaluate(value, span):
@@ -220,6 +241,17 @@ class StoreIntrin(Intrin):
 
 
 @register
+class AssumeIntrin(Intrin):
+    def __init__(self):
+        def assume(constraint, span):
+            return tvm.tir.Evaluate(
+                tvm.tir.call_intrin("bool", "tir.assume", constraint, span=span)
+            )
+
+        super().__init__(assume, stmt=True)
+
+
+@register
 def comm_reducer(lambda_io, identities, span):
     """Create a CommReducer from lambda inputs/outputs and the identities"""
     lambda_input = lambda_io[0]
@@ -234,3 +266,9 @@ def comm_reducer(lambda_io, identities, span):
         lambda_output = (lambda_output,)
 
     return tvm.tir.CommReducer(x, y, lambda_output, identities, span)
+
+
+@register
+def llvm_lookup_intrinsic_id(name, span):
+    # pylint: disable=unused-argument
+    return codegen.llvm_lookup_intrinsic_id(name)

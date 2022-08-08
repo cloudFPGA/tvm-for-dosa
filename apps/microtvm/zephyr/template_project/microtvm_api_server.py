@@ -20,13 +20,13 @@ import collections
 import collections.abc
 import enum
 import fcntl
+import json
 import logging
 import os
 import os.path
 import pathlib
 import queue
 import re
-import select
 import shlex
 import shutil
 import subprocess
@@ -34,8 +34,8 @@ import sys
 import tarfile
 import tempfile
 import threading
-import time
-import json
+from typing import Union
+import usb
 
 import serial
 import serial.tools.list_ports
@@ -60,6 +60,8 @@ IS_TEMPLATE = not (API_SERVER_DIR / MODEL_LIBRARY_FORMAT_RELPATH).exists()
 
 
 BOARDS = API_SERVER_DIR / "boards.json"
+
+CMAKELIST_FILENAME = "CMakeLists.txt"
 
 # Used to check Zephyr version installed on the host.
 # We only check two levels of the version.
@@ -165,40 +167,47 @@ def _get_device_args(options):
     )
 
 
-# kwargs passed to usb.core.find to find attached boards for the openocd flash runner.
-BOARD_USB_FIND_KW = {
-    "nucleo_l4r5zi": {"idVendor": 0x0483, "idProduct": 0x374B},
-    "nucleo_f746zg": {"idVendor": 0x0483, "idProduct": 0x374B},
-    "stm32f746g_disco": {"idVendor": 0x0483, "idProduct": 0x374B},
-    "mimxrt1050_evk": {"idVendor": 0x1366, "idProduct": 0x0105},
-}
+def generic_find_serial_port(serial_number=None):
+    """Find a USB serial port based on its serial number or its VID:PID.
 
+    This method finds a USB serial port device path based on the port's serial number (if given) or
+    based on the board's idVendor and idProduct ids.
 
-def openocd_serial(options):
-    """Find the serial port to use for a board with OpenOCD flash strategy."""
-    if "openocd_serial" in options:
-        return options["openocd_serial"]
+    Parameters
+    ----------
+    serial_number : str
+        The serial number associated to the USB serial port which the board is attached to. This is
+        the same number as shown by 'lsusb -v' in the iSerial field.
 
-    import usb  # pylint: disable=import-outside-toplevel
+    Returns
+    -------
+    Path to the USB serial port device, for example /dev/ttyACM1.
+    """
+    if serial_number:
+        regex = serial_number
+    else:
+        prop = BOARD_PROPERTIES[CMAKE_CACHE["BOARD"]]
+        device_id = ":".join([prop["vid_hex"], prop["pid_hex"]])
+        regex = device_id
 
-    find_kw = BOARD_USB_FIND_KW[CMAKE_CACHE["BOARD"]]
-    boards = usb.core.find(find_all=True, **find_kw)
-    serials = []
-    for b in boards:
-        serials.append(b.serial_number)
+    serial_ports = list(serial.tools.list_ports.grep(regex))
 
-    if len(serials) == 0:
-        raise BoardAutodetectFailed(f"No attached USB devices matching: {find_kw!r}")
-    serials.sort()
+    if len(serial_ports) == 0:
+        raise Exception(f"No serial port found for board {prop['board']}!")
 
-    autodetected_openocd_serial = serials[0]
-    _LOG.debug("zephyr openocd driver: autodetected serial %s", serials[0])
+    if len(serial_ports) != 1:
+        ports_lst = ""
+        for port in serial_ports:
+            ports_lst += f"Serial port: {port.device}, serial number: {port.serial_number}\n"
 
-    return autodetected_openocd_serial
+        raise Exception("Expected 1 serial port, found multiple ports:\n {ports_lst}")
+
+    return serial_ports[0].device
 
 
 def _get_openocd_device_args(options):
-    return ["--serial", openocd_serial(options)]
+    serial_number = options.get("openocd_serial")
+    return ["--serial", generic_find_serial_port(serial_number)]
 
 
 def _get_nrf_device_args(options):
@@ -268,13 +277,13 @@ PROJECT_OPTIONS = [
     ),
     server.ProjectOption(
         "verbose",
-        optional=["build"],
+        optional=["generate_project"],
         type="bool",
         help="Run build with verbose output.",
     ),
     server.ProjectOption(
         "west_cmd",
-        optional=["build"],
+        optional=["generate_project"],
         default=WEST_CMD,
         type="str",
         help=(
@@ -285,14 +294,14 @@ PROJECT_OPTIONS = [
     server.ProjectOption(
         "zephyr_base",
         required=(["generate_project", "open_transport"] if not ZEPHYR_BASE else None),
-        optional=(["generate_project", "open_transport", "build"] if ZEPHYR_BASE else ["build"]),
+        optional=(["generate_project", "open_transport"] if ZEPHYR_BASE else ["build"]),
         default=ZEPHYR_BASE,
         type="str",
         help="Path to the zephyr base directory.",
     ),
     server.ProjectOption(
         "zephyr_board",
-        required=["generate_project", "build", "flash", "open_transport"],
+        required=["generate_project"],
         choices=list(BOARD_PROPERTIES),
         type="str",
         help="Name of the Zephyr board to build for.",
@@ -315,6 +324,12 @@ PROJECT_OPTIONS = [
         type="str",
         help="Extra definitions added project compile.",
     ),
+    server.ProjectOption(
+        "cmsis_path",
+        optional=["generate_project"],
+        type="str",
+        help="Path to the CMSIS directory.",
+    ),
 ]
 
 
@@ -323,6 +338,13 @@ def get_zephyr_base(options: dict):
     zephyr_base = options.get("zephyr_base", ZEPHYR_BASE)
     assert zephyr_base, "'zephyr_base' option not passed and not found by default!"
     return zephyr_base
+
+
+def get_cmsis_path(options: dict) -> pathlib.Path:
+    """Returns CMSIS dependency path"""
+    cmsis_path = options.get("cmsis_path")
+    assert cmsis_path, "'cmsis_path' option not passed!"
+    return pathlib.Path(cmsis_path)
 
 
 class Handler(server.ProjectAPIHandler):
@@ -373,6 +395,7 @@ class Handler(server.ProjectAPIHandler):
 
             if options["project_type"] == "host_driven":
                 f.write(
+                    "CONFIG_TIMING_FUNCTIONS=y\n"
                     "# For RPC server C++ bindings.\n"
                     "CONFIG_CPLUSPLUS=y\n"
                     "CONFIG_LIB_CPLUSPLUS=y\n"
@@ -398,10 +421,11 @@ class Handler(server.ProjectAPIHandler):
             f.write("\n")
 
     API_SERVER_CRT_LIBS_TOKEN = "<API_SERVER_CRT_LIBS>"
+    CMAKE_ARGS_TOKEN = "<CMAKE_ARGS>"
 
     CRT_LIBS_BY_PROJECT_TYPE = {
-        "host_driven": "microtvm_rpc_server microtvm_rpc_common common",
-        "aot_demo": "memory microtvm_rpc_common common",
+        "host_driven": "microtvm_rpc_server microtvm_rpc_common aot_executor_module aot_executor common",
+        "aot_standalone_demo": "memory microtvm_rpc_common common",
     }
 
     def _get_platform_version(self, zephyr_base: str) -> float:
@@ -415,6 +439,46 @@ class Handler(server.ProjectAPIHandler):
                     version_minor = line.split("=")[1]
 
         return float(f"{version_major}.{version_minor}")
+
+    def _cmsis_required(self, project_path: Union[str, pathlib.Path]) -> bool:
+        """Check if CMSIS dependency is required."""
+        project_path = pathlib.Path(project_path)
+        for path in (project_path / "codegen" / "host" / "src").iterdir():
+            if path.is_file():
+                with open(path, "r") as lib_f:
+                    lib_content = lib_f.read()
+                if any(
+                    header in lib_content
+                    for header in [
+                        "<arm_nnsupportfunctions.h>",
+                        "arm_nn_types.h",
+                        "arm_nnfunctions.h",
+                    ]
+                ):
+                    return True
+        return False
+
+    def _generate_cmake_args(self, mlf_extracted_path, options) -> str:
+        cmake_args = "\n# cmake args\n"
+        if options.get("verbose"):
+            cmake_args += "set(CMAKE_VERBOSE_MAKEFILE TRUE)\n"
+
+        if options.get("zephyr_base"):
+            cmake_args += f"set(ZEPHYR_BASE {options['zephyr_base']})\n"
+
+        if options.get("west_cmd"):
+            cmake_args += f"set(WEST {options['west_cmd']})\n"
+
+        if self._is_qemu(options["zephyr_board"]):
+            # Some boards support more than one emulator, so ensure QEMU is set.
+            cmake_args += f"set(EMU_PLATFORM qemu)\n"
+
+        cmake_args += f"set(BOARD {options['zephyr_board']})\n"
+
+        enable_cmsis = self._cmsis_required(mlf_extracted_path)
+        cmake_args += f"set(ENABLE_CMSIS {str(enable_cmsis).upper()})\n"
+
+        return cmake_args
 
     def generate_project(self, model_library_format_path, standalone_crt_dir, project_dir, options):
         # Check Zephyr version
@@ -447,7 +511,7 @@ class Handler(server.ProjectAPIHandler):
             os.makedirs(extract_path)
             tf.extractall(path=extract_path)
 
-        if self._is_qemu(options):
+        if self._is_qemu(options["zephyr_board"]):
             shutil.copytree(API_SERVER_DIR / "qemu-hack", project_dir / "qemu-hack")
 
         # Populate CRT.
@@ -462,12 +526,15 @@ class Handler(server.ProjectAPIHandler):
                 shutil.copy2(src_path, dst_path)
 
         # Populate Makefile.
-        with open(API_SERVER_DIR / "CMakeLists.txt.template", "r") as cmake_template_f:
-            with open(project_dir / "CMakeLists.txt", "w") as cmake_f:
+        with open(project_dir / CMAKELIST_FILENAME, "w") as cmake_f:
+            with open(API_SERVER_DIR / f"{CMAKELIST_FILENAME}.template", "r") as cmake_template_f:
                 for line in cmake_template_f:
                     if self.API_SERVER_CRT_LIBS_TOKEN in line:
                         crt_libs = self.CRT_LIBS_BY_PROJECT_TYPE[options["project_type"]]
                         line = line.replace("<API_SERVER_CRT_LIBS>", crt_libs)
+
+                    if self.CMAKE_ARGS_TOKEN in line:
+                        line = self._generate_cmake_args(extract_path, options)
 
                     cmake_f.write(line)
 
@@ -497,19 +564,7 @@ class Handler(server.ProjectAPIHandler):
     def build(self, options):
         BUILD_DIR.mkdir()
 
-        cmake_args = ["cmake", ".."]
-        if options.get("verbose"):
-            cmake_args.append("-DCMAKE_VERBOSE_MAKEFILE:BOOL=TRUE")
-
-        if options.get("zephyr_base"):
-            cmake_args.append(f"-DZEPHYR_BASE:STRING={options['zephyr_base']}")
-
-        if options.get("west_cmd"):
-            cmake_args.append(f"-DWEST={options['west_cmd']}")
-
-        cmake_args.append(f"-DBOARD:STRING={options['zephyr_board']}")
-
-        check_call(cmake_args, cwd=BUILD_DIR)
+        check_call(["cmake", ".."], cwd=BUILD_DIR)
 
         args = ["make", "-j2"]
         if options.get("verbose"):
@@ -519,25 +574,35 @@ class Handler(server.ProjectAPIHandler):
     # A list of all zephyr_board values which are known to launch using QEMU. Many platforms which
     # launch through QEMU by default include "qemu" in their name. However, not all do. This list
     # includes those tested platforms which do not include qemu.
-    _KNOWN_QEMU_ZEPHYR_BOARDS = ("mps2_an521",)
+    _KNOWN_QEMU_ZEPHYR_BOARDS = ("mps2_an521", "mps3_an547")
 
     @classmethod
-    def _is_qemu(cls, options):
-        return (
-            "qemu" in options["zephyr_board"]
-            or options["zephyr_board"] in cls._KNOWN_QEMU_ZEPHYR_BOARDS
-        )
+    def _is_qemu(cls, board: str) -> bool:
+        return "qemu" in board or board in cls._KNOWN_QEMU_ZEPHYR_BOARDS
 
     @classmethod
     def _has_fpu(cls, zephyr_board):
         fpu_boards = [name for name, board in BOARD_PROPERTIES.items() if board["fpu"]]
         return zephyr_board in fpu_boards
 
-    def flash(self, options):
-        if self._is_qemu(options):
-            return  # NOTE: qemu requires no flash step--it is launched from open_transport.
+    @classmethod
+    def _find_board_from_cmake_file(cls) -> str:
+        zephyr_board = None
+        with open(API_SERVER_DIR / CMAKELIST_FILENAME) as cmake_f:
+            for line in cmake_f:
+                if line.startswith("set(BOARD"):
+                    zephyr_board = line.strip("\n").strip("set(BOARD ").strip(")")
+                    break
 
-        zephyr_board = options["zephyr_board"]
+        if not zephyr_board:
+            raise RuntimeError(f"No Zephyr board set in the {API_SERVER_DIR / CMAKELIST_FILENAME}.")
+        return zephyr_board
+
+    def flash(self, options):
+        zephyr_board = self._find_board_from_cmake_file()
+
+        if self._is_qemu(zephyr_board):
+            return  # NOTE: qemu requires no flash step--it is launched from open_transport.
 
         # The nRF5340DK requires an additional `nrfjprog --recover` before each flash cycle.
         # This is because readback protection is enabled by default when this device is flashed.
@@ -552,7 +617,9 @@ class Handler(server.ProjectAPIHandler):
         check_call(["make", "flash"], cwd=API_SERVER_DIR / "build")
 
     def open_transport(self, options):
-        if self._is_qemu(options):
+        zephyr_board = self._find_board_from_cmake_file()
+
+        if self._is_qemu(zephyr_board):
             transport = ZephyrQemuTransport(options)
         else:
             transport = ZephyrSerialTransport(options)
@@ -588,6 +655,13 @@ def _set_nonblock(fd):
 
 
 class ZephyrSerialTransport:
+
+    NRF5340_VENDOR_ID = 0x1366
+
+    # NRF5340_DK v1.0.0 uses VCOM2
+    # NRF5340_DK v2.0.0 uses VCOM1
+    NRF5340_DK_BOARD_VCOM_BY_PRODUCT_ID = {0x1055: "VCOM2", 0x1051: "VCOM1"}
+
     @classmethod
     def _lookup_baud_rate(cls, options):
         # TODO(mehrdadh): remove this hack once dtlib.py is a standalone project
@@ -625,23 +699,30 @@ class ZephyrSerialTransport:
             parts = line.split()
             ports_by_vcom[parts[2]] = parts[1]
 
-        return ports_by_vcom["VCOM2"]
+        nrf_board = usb.core.find(idVendor=cls.NRF5340_VENDOR_ID)
+
+        if nrf_board == None:
+            raise Exception("_find_nrf_serial_port: unable to find NRF5340DK")
+
+        if nrf_board.idProduct in cls.NRF5340_DK_BOARD_VCOM_BY_PRODUCT_ID:
+            vcom_port = cls.NRF5340_DK_BOARD_VCOM_BY_PRODUCT_ID[nrf_board.idProduct]
+        else:
+            raise Exception("_find_nrf_serial_port: unable to find known NRF5340DK product ID")
+
+        return ports_by_vcom[vcom_port]
 
     @classmethod
     def _find_openocd_serial_port(cls, options):
-        serial_number = openocd_serial(options)
-        ports = [p for p in serial.tools.list_ports.grep(serial_number)]
-        if len(ports) != 1:
-            raise Exception(
-                f"_find_openocd_serial_port: expected 1 port to match {serial_number}, "
-                f"found: {ports!r}"
-            )
-
-        return ports[0].device
+        serial_number = options.get("openocd_serial")
+        return generic_find_serial_port(serial_number)
 
     @classmethod
     def _find_jlink_serial_port(cls, options):
-        return cls._find_openocd_serial_port(options)
+        return generic_find_serial_port()
+
+    @classmethod
+    def _find_stm32cubeprogrammer_serial_port(cls, options):
+        return generic_find_serial_port()
 
     @classmethod
     def _find_serial_port(cls, options):
@@ -655,6 +736,9 @@ class ZephyrSerialTransport:
 
         if flash_runner == "jlink":
             return cls._find_jlink_serial_port(options)
+
+        if flash_runner == "stm32cubeprogrammer":
+            return cls._find_stm32cubeprogrammer_serial_port(options)
 
         raise RuntimeError(f"Don't know how to deduce serial port for flash runner {flash_runner}")
 
@@ -717,17 +801,15 @@ class ZephyrQemuTransport:
         os.mkfifo(self.write_pipe)
         os.mkfifo(self.read_pipe)
 
-        if "gdbserver_port" in self.options:
-            if "env" in self.kwargs:
-                self.kwargs["env"] = copy.copy(self.kwargs["env"])
-            else:
-                self.kwargs["env"] = os.environ.copy()
-
-            self.kwargs["env"]["TVM_QEMU_GDBSERVER_PORT"] = str(self.options["gdbserver_port"])
+        env = None
+        if self.options.get("gdbserver_port"):
+            env = os.environ.copy()
+            env["TVM_QEMU_GDBSERVER_PORT"] = self.options["gdbserver_port"]
 
         self.proc = subprocess.Popen(
             ["make", "run", f"QEMU_PIPE={self.pipe}"],
             cwd=BUILD_DIR,
+            env=env,
             stdout=subprocess.PIPE,
         )
         self._wait_for_qemu()

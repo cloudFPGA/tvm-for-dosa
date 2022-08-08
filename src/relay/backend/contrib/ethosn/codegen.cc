@@ -83,7 +83,7 @@ void InferTensorsVisitor::InferCall(const CallNode* cn) {
   if (IsEthosnFunc(call, "ethos-n.qnn_conv2d")) {
     ConvolutionParams params;
     err += EthosnAPI::QnnConv2d(cn->op.as<FunctionNode>()->body, &params);
-    tensor_table_[cn->args[0]] = {params.activation_info};
+    tensor_table_[cn->args[0]] = {params.input_info};
   } else if (IsEthosnFunc(call, "ethos-n.qnn_fc")) {
     FullyConnectedParams params;
     err += EthosnAPI::QnnFullyConnected(cn->op.as<FunctionNode>()->body, &params);
@@ -115,6 +115,14 @@ void InferTensorsVisitor::InferCall(const CallNode* cn) {
   } else if (IsEthosnFunc(call, "ethos-n.qnn_mean")) {
     MeanParams params;
     err += EthosnAPI::Mean(cn->op.as<FunctionNode>()->body, &params);
+    tensor_table_[cn->args[0]] = {params.input_info};
+  } else if (IsEthosnFunc(call, "ethos-n.qnn_tanh")) {
+    TanhParams params;
+    err += EthosnAPI::Tanh(cn->op.as<FunctionNode>()->body, &params);
+    tensor_table_[cn->args[0]] = {params.input_info};
+  } else if (IsEthosnFunc(call, "ethos-n.qnn_leaky_relu")) {
+    LeakyReLUParams params;
+    err += EthosnAPI::LeakyReLU(cn->op.as<FunctionNode>()->body, &params);
     tensor_table_[cn->args[0]] = {params.input_info};
   } else if (IsEthosnOp(call, "qnn.concatenate")) {
     ConcatenateParams params;
@@ -201,13 +209,18 @@ sl::TensorsAndId MakeOps(const sl::TensorAndId<sl::Operand>& op) {
   return ops;
 }
 
-String MakeVariant(auto configuration) {
+String MakeVariant(Optional<EthosnCompilerConfig> configuration) {
   String variant = configuration.value()->variant;
   // Transform variant string to lowercase for comparison
   std::string variant_string = variant.c_str();
-  std::transform(variant_string.begin(), variant_string.end(), variant_string.begin(), ::tolower);
-  std::string variant_n78 = "ethos-n78";
-  if (variant_string == variant_n78) {
+
+  // Checking deprecated variant format. Support for specifying
+  // the variant in this way only remains for backwards compatibility
+  // and will be removed in a later release of TVM.
+  std::string deprecated_variant_string = variant_string;
+  std::transform(deprecated_variant_string.begin(), deprecated_variant_string.end(),
+                 deprecated_variant_string.begin(), ::tolower);
+  if (variant_string == "n78" || deprecated_variant_string == "ethos-n78") {
     String tops = configuration.value()->tops;
     String ple_ratio = configuration.value()->ple_ratio;
     variant = "Ethos-N78_" + tops + "TOPS_" + ple_ratio + "PLE_RATIO";
@@ -282,6 +295,12 @@ sl::TensorsAndId ConstructNetworkVisitor::HandleCall(const CallNode* cn) {
     return MakeOps(tensor);
   } else if (IsEthosnFunc(call, "ethos-n.qnn_mean")) {
     if ((err = MakeMeanLayer(call, &tensor))) ReportFatalError(call, err);
+    return MakeOps(tensor);
+  } else if (IsEthosnFunc(call, "ethos-n.qnn_tanh")) {
+    if ((err = MakeTanhLayer(call, &tensor))) ReportFatalError(call, err);
+    return MakeOps(tensor);
+  } else if (IsEthosnFunc(call, "ethos-n.qnn_leaky_relu")) {
+    if ((err = MakeLeakyReLULayer(call, &tensor))) ReportFatalError(call, err);
     return MakeOps(tensor);
   } else if (IsEthosnOp(call, "qnn.concatenate")) {
     if ((err = MakeConcatenateLayer(call, &tensor))) ReportFatalError(call, err);
@@ -473,6 +492,36 @@ EthosnError ConstructNetworkVisitor::MakeMeanLayer(const Call& call,
   return EthosnError();
 }
 
+EthosnError ConstructNetworkVisitor::MakeTanhLayer(const Call& call,
+                                                   sl::TensorAndId<sl::Operand>* out) {
+  auto input = operand_table_[call->args[0]][0];
+
+  try {
+    *out = AddTanh(network_, *input);
+  } catch (const sl::NotSupportedException& e) {
+    return EthosnError(e.what());
+  }
+  return EthosnError();
+}
+
+EthosnError ConstructNetworkVisitor::MakeLeakyReLULayer(const Call& call,
+                                                        sl::TensorAndId<sl::Operand>* out) {
+  LeakyReLUParams params;
+  params.input_info = GetTensorInfo(tensor_table_, call);
+  if (auto err = EthosnAPI::LeakyReLU(call->op.as<FunctionNode>()->body, &params)) {
+    return err;
+  }
+
+  auto input = operand_table_[call->args[0]][0];
+
+  try {
+    *out = AddLeakyRelu(network_, *input, params.leaky_relu_info);
+  } catch (const sl::NotSupportedException& e) {
+    return EthosnError(e.what());
+  }
+  return EthosnError();
+}
+
 EthosnError ConstructNetworkVisitor::MakeConcatenateLayer(const Call& call,
                                                           sl::TensorAndId<sl::Operand>* out) {
   ConcatenateParams params;
@@ -580,6 +629,7 @@ runtime::ethosn::OrderedCompiledNetwork EthosnCompiler::CompileEthosnFunc(const 
   // Determine the order that the inputs/outputs are in and how that corresponds to the
   // order that the TVM runtime will expect them in
   auto input_output_order = GetInputOutputOrder(network_with_ids, compiled_network);
+  auto io_sizes = GetIOSizes(compiled_network);
   // Use the order information to create an 'ordered' network with includes how to map
   // the inputs/outputs from the TVM runtime to the inputs/outputs of the compiled network
   runtime::ethosn::OrderedCompiledNetwork ordered_network;
@@ -587,6 +637,8 @@ runtime::ethosn::OrderedCompiledNetwork EthosnCompiler::CompileEthosnFunc(const 
   ordered_network.compiled_cmm = std::move(compiled_network);
   ordered_network.inputs = input_output_order.first;
   ordered_network.outputs = input_output_order.second;
+  ordered_network.input_sizes = io_sizes.first;
+  ordered_network.output_sizes = io_sizes.second;
   return ordered_network;
 }
 
@@ -613,8 +665,6 @@ sl::CompilationOptions EthosnCompiler::CreateOptions() {
   options.m_EnableIntermediateCompression = cfg.value()->enable_intermediate_compression;
   options.m_DisableWinograd = cfg.value()->disable_winograd;
   options.m_DebugInfo.m_DebugDir = cfg.value()->debug_dir;
-  options.m_CompilerAlgorithm =
-      sl::EthosNCompilerAlgorithmFromString(cfg.value()->compiler_algorithm.c_str());
   return options;
 }
 
@@ -635,6 +685,20 @@ std::pair<std::vector<uint32_t>, std::vector<uint32_t>> EthosnCompiler::GetInput
     output_order.push_back(network.output_ids[output_id]);
   }
   return std::make_pair(input_order, output_order);
+}
+
+std::pair<std::vector<uint32_t>, std::vector<uint32_t>> EthosnCompiler::GetIOSizes(
+    const std::unique_ptr<sl::CompiledNetwork>& compiled_network) {
+  std::vector<uint32_t> input_sizes;
+  std::vector<uint32_t> output_sizes;
+  for (const sl::InputBufferInfo info : compiled_network->GetInputBufferInfos()) {
+    input_sizes.push_back(info.m_Size);
+  }
+  for (const sl::OutputBufferInfo info : compiled_network->GetOutputBufferInfos()) {
+    output_sizes.push_back(info.m_Size);
+  }
+
+  return std::make_pair(input_sizes, output_sizes);
 }
 
 std::unique_ptr<sl::SupportQueries> EthosnCompiler::m_Queries;
@@ -665,11 +729,11 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.conv2d")
       if (params.is_depthwise) {
         *rv = !err && EthosnCompiler::GetSupported()->IsDepthwiseConvolutionSupported(
                           params.bias_info, params.weights_info, params.conv_info,
-                          params.activation_info, nullptr, reason, sizeof(reason));
+                          params.input_info, &params.output_info, reason, sizeof(reason));
       } else {
         *rv = !err && EthosnCompiler::GetSupported()->IsConvolutionSupported(
                           params.bias_info, params.weights_info, params.conv_info,
-                          params.activation_info, nullptr, reason, sizeof(reason));
+                          params.input_info, &params.output_info, reason, sizeof(reason));
       }
       err += EthosnError(reason);
     });
@@ -684,7 +748,7 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.fc")
       reason[0] = '\0';
       *rv = !err && EthosnCompiler::GetSupported()->IsFullyConnectedSupported(
                         params.bias_info, params.weights_info, params.fc_info, params.input_info,
-                        nullptr, reason, sizeof(reason));
+                        &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -696,8 +760,9 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.max_pool2d")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsPoolingSupported(
-                        params.pool_info, params.input_info, nullptr, reason, sizeof(reason));
+      *rv = !err &&
+            EthosnCompiler::GetSupported()->IsPoolingSupported(
+                params.pool_info, params.input_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -709,8 +774,9 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.avg_pool2d")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsPoolingSupported(
-                        params.pool_info, params.input_info, nullptr, reason, sizeof(reason));
+      *rv = !err &&
+            EthosnCompiler::GetSupported()->IsPoolingSupported(
+                params.pool_info, params.input_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -718,12 +784,14 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.reshape")
     .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* rv) {
       Call call = args[0];
       ReshapeParams params;
+      EthosnAPI::DefaultInputTensor(call);
       auto err = EthosnAPI::Reshape(call, &params);
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsReshapeSupported(
-                        params.new_shape, params.input_info, nullptr, reason, sizeof(reason));
+      *rv = !err &&
+            EthosnCompiler::GetSupported()->IsReshapeSupported(
+                params.new_shape, params.input_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -736,8 +804,8 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.addition")
       char reason[kReasonMaxLength];
       reason[0] = '\0';
       *rv = !err && EthosnCompiler::GetSupported()->IsAdditionSupported(
-                        params.lhs_info, params.rhs_info, params.output_quantization_info, nullptr,
-                        reason, sizeof(reason));
+                        params.lhs_info, params.rhs_info, params.output_quantization_info,
+                        &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -749,8 +817,8 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.sigmoid")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsSigmoidSupported(params.input_info, nullptr,
-                                                                       reason, sizeof(reason));
+      *rv = !err && EthosnCompiler::GetSupported()->IsSigmoidSupported(
+                        params.input_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -762,8 +830,35 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.mean")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsMeanXySupported(params.input_info, nullptr,
-                                                                      reason, sizeof(reason));
+      *rv = !err && EthosnCompiler::GetSupported()->IsMeanXySupported(
+                        params.input_info, &params.output_info, reason, sizeof(reason));
+      err += EthosnError(reason);
+    });
+
+TVM_REGISTER_GLOBAL("relay.ethos-n.support.tanh")
+    .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* rv) {
+      Call call = args[0];
+      TanhParams params;
+      auto err = EthosnAPI::Tanh(call, &params);
+      err += EthosnCompiler::SupportedSetup();
+      char reason[kReasonMaxLength];
+      reason[0] = '\0';
+      *rv = !err && EthosnCompiler::GetSupported()->IsTanhSupported(
+                        params.input_info, &params.output_info, reason, sizeof(reason));
+      err += EthosnError(reason);
+    });
+
+TVM_REGISTER_GLOBAL("relay.ethos-n.support.leaky_relu")
+    .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* rv) {
+      Call call = args[0];
+      LeakyReLUParams params;
+      auto err = EthosnAPI::LeakyReLU(call, &params);
+      err += EthosnCompiler::SupportedSetup();
+      char reason[kReasonMaxLength];
+      reason[0] = '\0';
+      *rv = !err && EthosnCompiler::GetSupported()->IsLeakyReluSupported(
+                        params.leaky_relu_info, params.input_info, &params.output_info, reason,
+                        sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -776,7 +871,8 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.concatenate")
       char reason[kReasonMaxLength];
       reason[0] = '\0';
       *rv = !err && EthosnCompiler::GetSupported()->IsConcatenationSupported(
-                        params.input_infos, params.concat_info, nullptr, reason, sizeof(reason));
+                        params.input_infos, params.concat_info, &params.output_info, reason,
+                        sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -784,6 +880,7 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.split")
     .set_body([](tvm::TVMArgs args, tvm::TVMRetValue* rv) {
       Call call = args[0];
       SplitParams params;
+      EthosnAPI::DefaultInputTensor(call);
       auto err = EthosnAPI::Split(call, &params);
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
@@ -801,8 +898,9 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.depth_to_space")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsDepthToSpaceSupported(
-                        params.input_info, params.depth_info, nullptr, reason, sizeof(reason));
+      *rv = !err &&
+            EthosnCompiler::GetSupported()->IsDepthToSpaceSupported(
+                params.input_info, params.depth_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 
@@ -814,8 +912,9 @@ TVM_REGISTER_GLOBAL("relay.ethos-n.support.relu")
       err += EthosnCompiler::SupportedSetup();
       char reason[kReasonMaxLength];
       reason[0] = '\0';
-      *rv = !err && EthosnCompiler::GetSupported()->IsReluSupported(
-                        params.relu_info, params.input_info, nullptr, reason, sizeof(reason));
+      *rv = !err &&
+            EthosnCompiler::GetSupported()->IsReluSupported(
+                params.relu_info, params.input_info, &params.output_info, reason, sizeof(reason));
       err += EthosnError(reason);
     });
 

@@ -106,8 +106,18 @@ class VarUseDefAnalysis : public StmtExprMutator {
     return StmtExprMutator::VisitStmt_(op);
   }
 
+  Stmt VisitStmt_(const AllocateConstNode* op) final {
+    this->HandleDef(op->buffer_var.get());
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
   Stmt VisitStmt_(const StoreNode* op) final {
-    this->HandleUse(op->buffer_var);
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+    return Stmt();
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    VisitBuffer(op->buffer);
     return StmtExprMutator::VisitStmt_(op);
   }
 
@@ -155,8 +165,25 @@ class VarUseDefAnalysis : public StmtExprMutator {
   }
 
   PrimExpr VisitExpr_(const LoadNode* op) final {
-    this->HandleUse(op->buffer_var);
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+    return PrimExpr();
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    VisitBuffer(op->buffer);
     return StmtExprMutator::VisitExpr_(op);
+  }
+
+  void VisitBuffer(Buffer buffer) {
+    this->HandleUse(buffer->data);
+    auto visit_arr = [&](Array<PrimExpr> arr) {
+      for (const auto& element : arr) {
+        this->VisitExpr(element);
+      }
+    };
+
+    visit_arr(buffer->shape);
+    visit_arr(buffer->strides);
   }
 
   void HandleDef(const VarNode* v) {
@@ -254,7 +281,12 @@ class HostDeviceSplitter : public StmtMutator {
         // Create a new version of v.
         auto it = handle_data_type_.find(var.get());
         if (it != handle_data_type_.end()) {
-          tir::Var new_var(var->name_hint, PointerType(PrimType((*it).second->dtype)));
+          String storage_scope;
+          if (auto* ptr_type = var->type_annotation.as<PointerTypeNode>()) {
+            storage_scope = ptr_type->storage_scope;
+          }
+          tir::Var new_var(var->name_hint,
+                           PointerType(PrimType((*it).second->dtype), storage_scope));
           params.push_back(new_var);
           remap_vars.Set(var, new_var);
         } else {

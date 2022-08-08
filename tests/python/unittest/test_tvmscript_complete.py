@@ -62,7 +62,7 @@ def elementwise_with_root(a: T.handle, b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, [128, 128])
     C = T.match_buffer(c, [128, 128])
 
-    with T.block() as []:
+    with T.block():
         for i, j in T.grid(128, 128):
             with T.block():
                 vi, vj = T.axis.remap("SS", [i, j])
@@ -78,8 +78,8 @@ def func_with_opaque_block(a: T.handle, b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, [128, 128])
     C = T.match_buffer(c, [128, 128])
 
-    with T.block() as []:
-        with T.block() as []:
+    with T.block():
+        with T.block():
             B[0, 0] = A[0, 0] + T.float32(1)
         for i, j in T.grid(128, 128):
             with T.block():
@@ -93,7 +93,7 @@ def func_with_part_access_region(a: T.handle, b: T.handle, c: T.handle) -> None:
     B = T.match_buffer(b, [128, 128])
     C = T.match_buffer(c, [128, 128])
 
-    with T.block() as []:
+    with T.block():
         for i, j in T.grid(128, 128):
             with T.block():
                 vi, vj = T.axis.remap("SS", [i, j])
@@ -117,7 +117,7 @@ def test_complete_matmul():
     access_A = tvm.tir.BufferRegion(A, [Range.from_min_extent(vi, 1), Range.from_min_extent(vk, 1)])
     access_B = tvm.tir.BufferRegion(B, [Range.from_min_extent(vj, 1), Range.from_min_extent(vk, 1)])
     access_C = tvm.tir.BufferRegion(C, [Range.from_min_extent(vi, 1), Range.from_min_extent(vj, 1)])
-    tvm.ir.assert_structural_equal(block.reads, [access_C, access_A, access_B])
+    tvm.ir.assert_structural_equal(block.reads, [access_A, access_B])
     tvm.ir.assert_structural_equal(block.writes, [access_C])
 
 
@@ -210,7 +210,7 @@ def expected_bufferslice_indices(data: T.handle, index: T.handle) -> None:
         for i0, i1 in T.grid(16, 16):
             with T.block():
                 vi, vj = T.axis.remap("SS", [i0, i1])
-                T.reads([data_buf[vi, 0:16], index_buf[0]])
+                T.reads([data_buf[vi, index_buf[0]], index_buf[0]])
                 T.writes([out_buf[vi, vj]])
                 out_buf[vi, vj] = data_buf[vi, index_buf[0]]
 
@@ -238,7 +238,12 @@ def expected_recursive_bufferslice_indices(data: T.handle, index: T.handle) -> N
         for i0, i1 in T.grid(16, 16):
             with T.block():
                 vi, vj = T.axis.remap("SS", [i0, i1])
-                T.reads([data_buf[0:16, 0:16], index_buf[0]])
+                T.reads(
+                    [
+                        data_buf[index_buf[index_buf[0]], index_buf[0]],
+                        index_buf[T.min(index_buf[0], 0) : T.max(index_buf[0], 0) + 1],
+                    ]
+                )
                 T.writes([out_buf[vi, vj]])
                 out_buf[vi, vj] = data_buf[index_buf[index_buf[0]], index_buf[0]]
 
@@ -258,7 +263,7 @@ def match_buffer_func(a: T.handle) -> None:
             A0 = T.match_buffer(A[i, 0:16], (16))
             with T.block():
                 for j in range(0, 16):
-                    with T.block() as []:
+                    with T.block():
                         A1 = T.match_buffer(A0[j], ())
                         A1[()] = 1.0
 
@@ -275,7 +280,7 @@ def expected_match_buffer_func(a: T.handle) -> None:
                 T.reads([])
                 T.writes(A0[0:16])
                 for j in range(0, 16):
-                    with T.block() as []:
+                    with T.block():
                         T.reads([])
                         T.writes(A0[j])
                         A1 = T.match_buffer(A0[j], ())
@@ -312,12 +317,6 @@ def expect_alloc_buffer_func(a: T.handle, b: T.handle) -> None:
 def test_complete_alloc_buffer():
     rt_func = tvm.script.from_source(alloc_buffer_func.script(show_meta=True))
     tvm.ir.assert_structural_equal(alloc_buffer_func, expect_alloc_buffer_func)
-
-
-@T.prim_func
-def load_var() -> None:
-    d = T.var("float32")
-    d[1] = d[1]
 
 
 if __name__ == "__main__":

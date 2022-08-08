@@ -26,6 +26,7 @@
 
 #include <tvm/te/operation.h>
 #include <tvm/tir/data_layout.h>
+#include <tvm/tir/index_map.h>
 #include <tvm/topi/broadcast.h>
 #include <tvm/topi/detail/broadcast.h>
 #include <tvm/topi/detail/constant_utils.h>
@@ -329,7 +330,8 @@ inline Tensor reshape(const Tensor& x, Array<PrimExpr> newshape, std::string nam
     }
   }
 
-  if (is_empty_shape(target_shape)) {
+  // If either the input shape or the target shape contains a zero, return an empty tensor.
+  if (is_empty_shape(target_shape) || is_empty_shape(x->shape)) {
     return compute(
         target_shape, [&](const Array<Var>& indices) { return tvm::cast(x->dtype, 0); }, name, tag);
   } else {
@@ -788,8 +790,8 @@ inline Tensor strided_slice_with_axes(const Tensor& x, const Array<Integer>& beg
         for (size_t i = 0; i < out_shape.size(); ++i) real_indices.push_back(indices[i]);
         for (size_t i = 0; i < axes.size(); ++i) {
           auto stride = make_const(strides[i].dtype(), strides_vec[i]);
-          PrimExpr ind = indices[axes[i]] * stride + begin_expr[i];
-          real_indices.Set(axes[i], ind);
+          PrimExpr ind = indices[axes[i].IntValue()] * stride + begin_expr[i];
+          real_indices.Set(axes[i].IntValue(), ind);
         }
         return x(real_indices);
       },
@@ -1466,10 +1468,11 @@ inline Tensor tensordot(const Tensor& A, const tvm::te::Tensor& B, int axes = 2,
     for (; it != input_indices.end(); ++it) B_indices.push_back(*it);
 
     // Some passes don't like reductions with empty axis, so avoid it here
-    if (iter_vars.empty())
+    if (iter_vars.empty()) {
       return A(A_indices) * B(B_indices);
-    else
+    } else {
       return sum(A(A_indices) * B(B_indices), iter_vars);
+    }
   };
 
   return compute(output_shape, func, name, tag);
@@ -1512,19 +1515,21 @@ inline Tensor tensordot(const Tensor& A, const tvm::te::Tensor& B, Array<PrimExp
     Array<PrimExpr> A_indices;
     for (unsigned i = 0; i < A->shape.size(); ++i) {
       auto axes_pos = std::find(A_axes_val.begin(), A_axes_val.end(), i);
-      if (axes_pos == A_axes_val.end())
+      if (axes_pos == A_axes_val.end()) {
         A_indices.push_back(input_indices[idx_input++]);
-      else
+      } else {
         A_indices.push_back(iter_vars[axes_pos - A_axes_val.begin()]);
+      }
     }
 
     Array<PrimExpr> B_indices;
     for (unsigned i = 0; i < B->shape.size(); ++i) {
       auto axes_pos = std::find(B_axes_val.begin(), B_axes_val.end(), i);
-      if (axes_pos == B_axes_val.end())
+      if (axes_pos == B_axes_val.end()) {
         B_indices.push_back(input_indices[idx_input++]);
-      else
+      } else {
         B_indices.push_back(iter_vars[axes_pos - B_axes_val.begin()]);
+      }
     }
     return sum(A(A_indices) * B(B_indices), iter_vars);
   };
@@ -1566,7 +1571,11 @@ inline Array<Tensor> meshgrid(const Array<Tensor>& inputs, const std::string& in
         out_shape,
         [&](const Array<Var>& indices) {
           const int src_index = (cartesian_indexing && i < 2) ? 1 - i : i;
-          Array<PrimExpr> real_indices = {indices[src_index]};
+          auto ndim = inputs[i]->GetShape().size();
+          Array<PrimExpr> real_indices = {};
+          if (ndim > 0) {
+            real_indices = {indices[src_index]};
+          }
           return inputs[i](real_indices);
         },
         name, tag));
@@ -1608,7 +1617,11 @@ inline Tensor layout_transform(const Tensor& src, const std::string& src_layout,
       [&](const Array<Var>& dst_indices) {
         Array<PrimExpr> dst_indices_expr(dst_indices.begin(), dst_indices.end());
         Array<PrimExpr> src_indices = layout_converter.BackwardIndex(dst_indices_expr);
-        return src(src_indices);
+        PrimExpr in_range = PrimExpr(1) > PrimExpr(0);  // init with dtype=bool and value=true
+        for (size_t i = 0; i < src.ndim(); ++i) {
+          in_range = in_range && (src_indices[i] < src->shape[i]);
+        }
+        return if_then_else(in_range, src(src_indices), tvm::cast(src->dtype, PrimExpr(0)));
       },
       name, tag);
 }
@@ -1677,6 +1690,59 @@ inline Tensor auto_scheduler_layout_transform(const Tensor& src, const String& s
           src_indices.push_back(src_index);
         }
         return src(src_indices);
+      },
+      name, tag);
+}
+
+/*!
+ * \brief Transform the meta-schedule generated layout according to TIR's IndexMap
+ * \param src the source input.
+ * \param index_map The TIR IndexMap
+ * \param name output tensor name.
+ * \param tag output tensor tag.
+ * \return A tensor. The layout transformation method
+ * \note Example:
+ *
+ * For the indexing pattern below:
+ *
+ *  for i in range(32):
+ *    for j in range(64):
+ *      load A[
+ *        i / 16 *  4 + j / 16,
+ *        i % 16 * 16 + j % 16,
+ *      ]
+ *
+ *  The corresponding indexing pattern in TIR is:
+ *
+ *    A[i, j] => A'[i / 4, j / 16, i % 4, j % 16]
+ *
+ *  which converts the pattern to:
+ *
+ *  for i in range(32):
+ *    for j in range(64):
+ *      load A'[
+ *        i / 16 + j / 64,
+ *        i % 16,
+ *        j % 64 / 16,
+ *        j % 16,
+ *      ]
+ *
+ *  In this case, the transformation pattern is:
+ *    A'[a, b, c, d] = A[a * 4 + c, b * 16 + d]
+ */
+inline Tensor meta_schedule_layout_transform(const Tensor& src, const tir::IndexMap& index_map,
+                                             const String name = "T_meta_schedule_layout_trans",
+                                             const String tag = kInjective) {
+  Array<Range> iter_domain;
+  iter_domain.reserve(src->shape.size());
+  for (const PrimExpr& e : src->shape) {
+    iter_domain.push_back(Range::FromMinExtent(make_zero(e->dtype), e));
+  }
+  Array<PrimExpr> post_transform_shape = index_map->MapShape(src->shape);
+  return compute(
+      post_transform_shape,
+      [src, inv = index_map.Inverse(iter_domain)](const Array<Var>& indices) -> PrimExpr {
+        return src(inv->MapIndices(Array<PrimExpr>{indices.begin(), indices.end()}));
       },
       name, tag);
 }
@@ -1811,7 +1877,7 @@ inline Tensor sparse_to_dense(const Tensor& sparse_indices, const Array<PrimExpr
       [&](const Array<Var>& indices) {
         PrimExpr ret = default_value;
         if (0 == rank_sparse_indices) {
-          ret = if_then_else(indices[0] == sparse_indices[0], sparse_values[0], ret);
+          ret = if_then_else(indices[0] == sparse_indices(), sparse_values(), ret);
         } else if (1 == rank_sparse_indices) {
           for (int j = 0; j < GetConstInt(sparse_indices->shape[0]); j++) {
             ret = if_then_else(indices[0] == sparse_indices[j], sparse_values[j], ret);

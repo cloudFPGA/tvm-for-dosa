@@ -201,6 +201,8 @@ class QnnConv2DParams:
         from tvm.relay.backend.contrib.ethosu.util import RequantArgs
 
         activation = None
+        separate_padding = None
+
         if str(func_body.op) in self.activation_map.keys():
             activation = func_body
             requantize_op = activation.args[0]
@@ -208,8 +210,11 @@ class QnnConv2DParams:
             requantize_op = func_body
         bias_add = requantize_op.args[0]
         qnn_conv2d = bias_add.args[0]
+        if isinstance(qnn_conv2d.args[0], relay.Call) and str(qnn_conv2d.args[0].op) == "nn.pad":
+            separate_padding = qnn_conv2d.args[0]
         data_layout = qnn_conv2d.attrs.data_layout
         self.kernel_layout = qnn_conv2d.attrs.kernel_layout
+
         # We consider the weights & biases as params as it should be a Constant
         self.weights = TensorParams(
             qnn_conv2d.args[QConv2DArgs.WEIGHTS.value],
@@ -224,8 +229,11 @@ class QnnConv2DParams:
             requantize_op.args[RequantArgs.IFM_SCALE.value],
             requantize_op.args[RequantArgs.IFM_ZERO_POINT.value],
         )
+        ifm_tensor = (
+            separate_padding.args[0] if separate_padding else qnn_conv2d.args[QConv2DArgs.IFM.value]
+        )
         self.ifm = TensorParams(
-            qnn_conv2d.args[QConv2DArgs.IFM.value],
+            ifm_tensor,
             data_layout,
             qnn_conv2d.args[QConv2DArgs.IFM_SCALE.value],
             qnn_conv2d.args[QConv2DArgs.IFM_ZERO_POINT.value],
@@ -237,7 +245,10 @@ class QnnConv2DParams:
             requantize_op.args[RequantArgs.OFM_ZERO_POINT.value],
         )
         attrs = qnn_conv2d.attrs
-        self.padding = attrs.padding
+
+        pad_value = int(qnn_conv2d.args[QConv2DArgs.IFM_ZERO_POINT.value].data.asnumpy())
+        self.padding = self.extract_padding(attrs.padding, separate_padding, pad_value)
+
         self.strides = attrs.strides
         self.dilation = attrs.dilation
         self.activation = activation
@@ -249,6 +260,37 @@ class QnnConv2DParams:
         channels_axis = {"HWIO": 3, "HWOI": 2}
         if self.groups == self.weights.shape[channels_axis[self.kernel_layout]]:
             self.is_depthwise = True
+
+    @staticmethod
+    def extract_padding(
+        operator_padding: Tuple[int, int, int, int],
+        separate_padding: relay.Call,
+        pad_value: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Convolution operations can sometimes have padding represented as a separate
+        padding operation before the convolution operation itself. Here we can check
+        whether these representations can be combined into a single padding attribute
+        as part of the NPU convolution itself. If the padding specified by the separate
+        nn.pad operation is not supported, None will be returned. This will cause the
+        nn.pad to be offloaded separately.
+        """
+        if separate_padding is None:
+            return operator_padding
+        if pad_value != int(separate_padding.args[1].data.asnumpy()):
+            return None
+        pad_width = separate_padding.attrs["pad_width"]
+        if len(pad_width) != 4:
+            return None
+        if list(pad_width[0]) != [0, 0] or list(pad_width[3]) != [0, 0]:
+            return None
+        top, left, bottom, right = operator_padding
+        return [
+            top + pad_width[1][0],
+            left + pad_width[2][0],
+            bottom + pad_width[1][1],
+            right + pad_width[2][1],
+        ]
 
     def is_valid(self) -> bool:
         """
@@ -267,7 +309,7 @@ class QnnConv2DParams:
             return False
         if not check_dilation(self.dilation):
             return False
-        if not check_padding(self.padding, self.padding_bounds):
+        if not self.padding or not check_padding(self.padding, self.padding_bounds):
             return False
         legal_groups = [1, self.ofm.shape[3]]
         if self.groups not in legal_groups:
@@ -437,7 +479,7 @@ class QnnDepthwiseConv2DParams(QnnConv2DParams):
             return False
         if not check_dilation(self.dilation):
             return False
-        if not check_padding(self.padding, self.padding_bounds):
+        if not self.padding or not check_padding(self.padding, self.padding_bounds):
             return False
         if self.weights.layout != "HWOI":
             return False
@@ -453,8 +495,14 @@ def qnn_conv2d_pattern() -> tvm.relay.dataflow_pattern.DFPattern:
     """
     This function creates the pattern for qnn.conv2D with optional fused RELU activation.
     """
+    optional_pad = is_op("nn.pad")(wildcard(), is_constant())
     qnn_conv2d = is_op("qnn.conv2d")(
-        wildcard(), is_constant(), is_constant(), is_constant(), is_constant(), is_constant()
+        optional_pad | wildcard(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
     ).has_attr({"kernel_layout": "HWIO"})
     bias_add = is_op("nn.bias_add")(qnn_conv2d, is_constant())
     req = is_op("qnn.requantize")(
@@ -468,8 +516,14 @@ def qnn_depthwise_conv2d_pattern() -> tvm.relay.dataflow_pattern.DFPattern:
     """
     This function creates the pattern for depthwise qnn.conv2D with optional fused RELU activation.
     """
+    optional_pad = is_op("nn.pad")(wildcard(), is_constant())
     qnn_conv2d = is_op("qnn.conv2d")(
-        wildcard(), is_constant(), is_constant(), is_constant(), is_constant(), is_constant()
+        optional_pad | wildcard(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
+        is_constant(),
     ).has_attr({"kernel_layout": "HWOI"})
     bias_add = is_op("nn.bias_add")(qnn_conv2d, is_constant())
     req = is_op("qnn.requantize")(
@@ -559,7 +613,7 @@ class AvgPool2DParams:
 
     composite_name = "ethos-u.avgpool2d"
     # The hardware only supports padding upto the numbers as follows
-    padding_bounds = [127, 127, 128, 128]
+    padding_bounds = [3, 3, 4, 4]
 
     def __init__(self, func_body: Call):
         clip = None
@@ -578,6 +632,7 @@ class AvgPool2DParams:
         self.pool_shape = attrs.pool_size
         self.strides = attrs.strides
         self.padding = attrs.padding
+        self.count_include_pad = attrs.count_include_pad
         self.activation = clip
         self.pooling_type = "AVG"
 
@@ -594,9 +649,16 @@ class AvgPool2DParams:
             return False
         if not check_batch_size(self.ifm):
             return False
+        if self.count_include_pad:
+            return False
         if not check_padding(self.padding, self.padding_bounds):
             return False
         if not check_pool_shape(self.pool_shape):
+            return False
+        # Averge pool with padding only supports 1 <= pool_shape <= 8
+        if list(self.padding) != [0, 0, 0, 0] and (
+            self.pool_shape[0] > 8 or self.pool_shape[1] > 8
+        ):
             return False
         return True
 
@@ -618,19 +680,28 @@ class BinaryElementwiseParams:
     and extract the parameter information.
     """
 
-    def __init__(self, func_body: Call, operator_type: str, has_quantization_parameters: bool):
+    def __init__(self, func_body: Call, operator_type: str, is_quantized_operation: bool):
         from tvm.relay.backend.contrib.ethosu.util import BinaryElementwiseArgs
+        from tvm.relay.backend.contrib.ethosu.util import RequantArgs
 
+        current_call = func_body
         clip = None
-        if str(func_body.op) == "clip":
-            clip = func_body
-            binary_op = clip.args[0]
+        requantize = None
+
+        if is_quantized_operation:
+            if str(current_call.op) == "clip":
+                clip = current_call
+                current_call = clip.args[0]
         else:
-            binary_op = func_body
+            if str(current_call.op) == "qnn.requantize":
+                requantize = current_call
+                clip = current_call.args[0]
+                current_call = clip.args[0]
+        binary_op = current_call
 
         layout = "NHWC"
 
-        if has_quantization_parameters:
+        if is_quantized_operation:
             self.ifm = TensorParams(
                 binary_op.args[BinaryElementwiseArgs.IFM.value],
                 layout,
@@ -653,14 +724,20 @@ class BinaryElementwiseParams:
             self.ifm = TensorParams(
                 binary_op.args[BinaryElementwiseArgs.IFM.value],
                 layout,
+                requantize.args[RequantArgs.IFM_SCALE.value] if requantize else None,
+                requantize.args[RequantArgs.IFM_ZERO_POINT.value] if requantize else None,
             )
             self.ifm2 = TensorParams(
                 binary_op.args[BinaryElementwiseArgs.IFM2.value],
                 layout,
+                requantize.args[RequantArgs.IFM_SCALE.value] if requantize else None,
+                requantize.args[RequantArgs.IFM_ZERO_POINT.value] if requantize else None,
             )
             self.ofm = TensorParams(
-                binary_op,
+                func_body,
                 layout,
+                requantize.args[RequantArgs.OFM_SCALE.value] if requantize else None,
+                requantize.args[RequantArgs.OFM_ZERO_POINT.value] if requantize else None,
             )
         self.activation = clip
         self.operator_type = operator_type
@@ -859,9 +936,12 @@ def minimum_pattern() -> tvm.relay.dataflow_pattern.DFPattern:
     """
     This function creates the pattern for minimum with optional fused RELU activation.
     """
-    pattern = is_op("minimum")(wildcard(), wildcard())
-    pattern = pattern.optional(is_op("clip"))
-    return pattern
+    minimum = is_op("minimum")(wildcard(), wildcard())
+    optional_min_clip = is_op("clip")(minimum)
+    optional_min_clip = is_op("qnn.requantize")(
+        optional_min_clip, is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    return minimum | optional_min_clip
 
 
 class MaxParams(BinaryElementwiseParams):
@@ -894,9 +974,12 @@ def maximum_pattern() -> tvm.relay.dataflow_pattern.DFPattern:
     """
     This function creates the pattern for maximum with optional fused RELU activation.
     """
-    pattern = is_op("maximum")(wildcard(), wildcard())
-    pattern = pattern.optional(is_op("clip"))
-    return pattern
+    maximum = is_op("maximum")(wildcard(), wildcard())
+    optional_max_clip = is_op("clip")(maximum)
+    optional_max_clip = is_op("qnn.requantize")(
+        optional_max_clip, is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    return maximum | optional_max_clip
 
 
 class ShlParams(BinaryElementwiseParams):
@@ -1074,8 +1157,28 @@ class LutActivationParams:
     """
 
     def __init__(self, func_body: Call):
-        self.ofm = TensorParams(func_body)
-        self.ifm = TensorParams(func_body.args[0].args[0].args[0])
+        from tvm.relay.backend.contrib.ethosu.util import QuantizeArgs
+        from tvm.relay.backend.contrib.ethosu.util import DequantizeArgs
+
+        layout = "NHWC"
+
+        quantize = func_body
+        activation = quantize.args[0]
+        dequantize = activation.args[0]
+        in_var = dequantize.args[0]
+
+        self.ifm = TensorParams(
+            in_var,
+            layout=layout,
+            scale=dequantize.args[DequantizeArgs.IFM_SCALE.value],
+            zero_point=dequantize.args[DequantizeArgs.IFM_ZERO_POINT.value],
+        )
+        self.ofm = TensorParams(
+            quantize,
+            layout=layout,
+            scale=quantize.args[QuantizeArgs.OFM_SCALE.value],
+            zero_point=quantize.args[QuantizeArgs.OFM_ZERO_POINT.value],
+        )
 
     def is_valid(self):
         """
@@ -1114,6 +1217,28 @@ def sigmoid_pattern():
     sigmoid = is_op("sigmoid")(dequant)
     quant = is_op("qnn.quantize")(sigmoid, is_constant(), is_constant())
     return quant
+
+
+class LeakyReLUParams(LutActivationParams):
+    """
+    This class will parse a call to ethos-u.leaky_relu composite function
+    and extract the parameter information.
+    """
+
+    composite_name = "ethos-u.leaky_relu"
+
+    def __init__(self, func_body: Call):
+        super().__init__(func_body)
+        self.alpha = func_body.args[0].attrs.alpha
+
+
+def leaky_relu_pattern() -> tvm.relay.dataflow_pattern.DFPattern:
+    """
+    This function creates the pattern for leaky relu.
+    """
+    dequantize = is_op("qnn.dequantize")(wildcard(), is_constant(), is_constant())
+    leaky_relu = is_op("nn.leaky_relu")(dequantize)
+    return is_op("qnn.quantize")(leaky_relu, is_constant(), is_constant())
 
 
 class MeanParams:
@@ -1495,6 +1620,158 @@ def squeeze_pattern():
     return is_op("squeeze")(wildcard())
 
 
+class FullyConnectedParams:
+    """
+    This class will parse a call to an ethos-u.fully_connected composite
+    function and extract the parameter information.
+    """
+
+    composite_name = "ethos-u.fully_connected"
+
+    @requires_vela
+    def __init__(self, func_body):
+        from tvm.relay.backend.contrib.ethosu.util import QDenseArgs  # type: ignore
+        from tvm.relay.backend.contrib.ethosu.util import BiasAddArgs
+        from tvm.relay.backend.contrib.ethosu.util import RequantArgs
+
+        self.activation = None
+        if str(func_body.op) == "clip":
+            self.activation = func_body
+            requantize_op = self.activation.args[0]
+        else:
+            requantize_op = func_body
+
+        call = requantize_op.args[0]
+        if str(requantize_op.args[0].op) == "nn.bias_add":
+            bias_add = call
+            qnn_dense = call.args[0]
+        else:
+            bias_add = None
+            qnn_dense = call
+
+        # weights & biases are params as they should be constant
+        self.weights = TensorParams(
+            qnn_dense.args[QDenseArgs.WEIGHTS.value],
+            None,
+            qnn_dense.args[QDenseArgs.WEIGHTS_SCALE.value],
+            qnn_dense.args[QDenseArgs.WEIGHTS_ZERO_POINT.value],
+        )
+        self.biases = (
+            TensorParams(
+                bias_add.args[BiasAddArgs.BIASES.value],
+                None,
+                requantize_op.args[RequantArgs.IFM_SCALE.value],
+                requantize_op.args[RequantArgs.IFM_ZERO_POINT.value],
+            )
+            if bias_add
+            else None
+        )
+        self.ifm = TensorParams(
+            qnn_dense.args[QDenseArgs.IFM.value],
+            None,
+            qnn_dense.args[QDenseArgs.IFM_SCALE.value],
+            qnn_dense.args[QDenseArgs.IFM_ZERO_POINT.value],
+        )
+        self.ofm = TensorParams(
+            func_body,
+            None,
+            requantize_op.args[RequantArgs.OFM_SCALE.value],
+            requantize_op.args[RequantArgs.OFM_ZERO_POINT.value],
+        )
+
+    def is_valid(self) -> bool:
+        """
+        Checks whether Fully Connected has compatible attributes with HW
+        """
+
+        def check_weights_fc(weights):
+            """Checks whether weight tensor is compatible with HW"""
+            weights_limit = 127 * 65536
+            # A saturation upper bound check for accumulators
+            weights.values = weights.values - weights.q_params.zero_point
+            axis = 1
+            sum_weights = np.amax(np.sum(np.absolute(weights.values), axis=axis))
+            if not sum_weights <= weights_limit:
+                return False
+            return True
+
+        if not check_valid_dtypes([self.ifm, self.ofm], supported_dtypes=[np.int8]):
+            return False
+        if not check_weights_fc(self.weights):
+            return False
+        if not check_bias(self.biases):
+            return False
+        if not check_batch_size(self.ifm):
+            return False
+        # Check input shape
+        if not len(self.ifm.shape) == 2:
+            return False
+        # Check output shape
+        if not len(self.ofm.shape) == 2:
+            return False
+        return True
+
+
+def qnn_fc_pattern():
+    dense = is_op("qnn.dense")(
+        wildcard(), is_constant(), is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    optional_bias_add = is_op("nn.bias_add")(dense, is_constant())
+    req = is_op("qnn.requantize")(
+        dense | optional_bias_add, is_constant(), is_constant(), is_constant(), is_constant()
+    )
+    optional_clip = req.optional(is_op("clip"))
+    return optional_clip
+
+
+class HardSwishParams:
+    """
+    This class will parse a call to a ethos-u.hard_swish composite function
+    and extract the parameter information.
+    """
+
+    composite_name = "ethos-u.hard_swish"
+
+    def __init__(self, func_body):
+        from tvm.relay.backend.contrib.ethosu.util import QuantizeArgs
+        from tvm.relay.backend.contrib.ethosu.util import DequantizeArgs
+
+        quantize = func_body
+        divide = quantize.args[0]
+        multiply = divide.args[0]
+        clip = multiply.args[1]
+        add = clip.args[0]
+        dequantize = add.args[0]
+
+        self.ifm = TensorParams(
+            dequantize.args[0],
+            scale=dequantize.args[DequantizeArgs.IFM_SCALE.value],
+            zero_point=dequantize.args[DequantizeArgs.IFM_ZERO_POINT.value],
+        )
+        self.ofm = TensorParams(
+            quantize,
+            scale=quantize.args[QuantizeArgs.OFM_SCALE.value],
+            zero_point=quantize.args[QuantizeArgs.OFM_ZERO_POINT.value],
+        )
+
+    def is_valid(self):
+        tensor_params = [self.ifm, self.ofm]
+        if not check_valid_dtypes(tensor_params, supported_dtypes=[np.int8]):
+            return False
+        return True
+
+
+def hard_swish_pattern():
+    """Create the pattern for hard swish."""
+    dequantize = is_op("qnn.dequantize")(wildcard(), is_constant(), is_constant())
+    add = is_op("add")(dequantize, is_constant())
+    clip = is_op("clip")(add)
+    multiply = is_op("multiply")(dequantize, clip)
+    divide = is_op("divide")(multiply, is_constant())
+    quantize = is_op("qnn.quantize")(divide, is_constant(), is_constant())
+    return quantize
+
+
 @register_pattern_table("ethos-u")
 def pattern_table() -> List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Callable]]:
     return [
@@ -1512,6 +1789,11 @@ def pattern_table() -> List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Cal
             QnnConv2DTransposeParams.composite_name,
             qnn_conv2d_transpose_pattern(),
             lambda pat: QnnConv2DTransposeParams(pat).is_valid(),
+        ),
+        (
+            FullyConnectedParams.composite_name,
+            qnn_fc_pattern(),
+            lambda pat: FullyConnectedParams(pat).is_valid(),
         ),
         (
             MaxPool2DParams.composite_name,
@@ -1574,6 +1856,11 @@ def pattern_table() -> List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Cal
             mean_pattern(),
             lambda pat: MeanParams(pat).is_valid(),
         ),
+        (
+            LeakyReLUParams.composite_name,
+            leaky_relu_pattern(),
+            lambda pat: LeakyReLUParams(pat).is_valid(),
+        ),
         (ConcatParams.composite_name, concat_pattern(), lambda pat: ConcatParams(pat).is_valid()),
         (
             SigmoidParams.composite_name,
@@ -1605,13 +1892,21 @@ def pattern_table() -> List[Tuple[str, tvm.relay.dataflow_pattern.DFPattern, Cal
             squeeze_pattern(),
             lambda pat: SqueezeParams(pat).is_valid(),
         ),
+        (
+            HardSwishParams.composite_name,
+            hard_swish_pattern(),
+            lambda pat: HardSwishParams(pat).is_valid(),
+        ),
     ]
 
 
 # pylint: disable=unused-argument
 @requires_vela
 def partition_for_ethosu(
-    mod: tvm.ir.IRModule, params: Optional[Dict[str, tvm.runtime.NDArray]] = None, **opts
+    mod: tvm.ir.IRModule,
+    params: Optional[Dict[str, tvm.runtime.NDArray]] = None,
+    mod_name: str = "default",
+    **opts,
 ):
     """This helper function partition the relay graph as produced by the
     relay frontend for a given model into external functions
@@ -1623,6 +1918,8 @@ def partition_for_ethosu(
         The IRModule that gets generated from a relay frontend
     params : Optional[Dict[str, tvm.runtime.NDArray]]
         Constant input parameters.
+    mod_name: str, optional
+        The module name
 
     Returns
     -------
@@ -1640,7 +1937,7 @@ def partition_for_ethosu(
     mod = relay.transform.AnnotateTarget("ethos-u")(mod)
     mod = relay.transform.MergeCompilerRegions()(mod)
     mod = relay.transform.InferType()(mod)
-    mod = relay.transform.PartitionGraph()(mod)
+    mod = relay.transform.PartitionGraph(mod_name)(mod)
     mod = relay.transform.InferType()(mod)
     mod = preprocess.preprocess_ext_io()(mod)
     return mod

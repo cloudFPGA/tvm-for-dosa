@@ -274,6 +274,16 @@ class OpenCLWorkspace : public DeviceAPI {
         << "Invalid OpenCL device_id=" << dev.device_id;
     return events[dev.device_id];
   }
+  // is current clCommandQueue in profiling mode
+  bool IsProfiling(Device dev) {
+    cl_command_queue queue = GetQueue(dev);
+    cl_command_queue_properties prop;
+
+    OPENCL_CALL(clGetCommandQueueInfo(queue, CL_QUEUE_PROPERTIES,
+                                      sizeof(cl_command_queue_properties), &prop, nullptr));
+
+    return prop & CL_QUEUE_PROFILING_ENABLE;
+  }
 
   // override device API
   void SetDevice(Device dev) final;
@@ -332,7 +342,12 @@ class OpenCLThreadEntry {
   static OpenCLThreadEntry* ThreadLocal();
 };
 
-/*! \brief OpenCL runtime buffer structure with tracked memory layout */
+/*! \brief OpenCL runtime buffer structure with tracked memory layout
+    TODO(tvm-team): Uncouple use of storage scope and data layout by using the transform_layout
+    schedule primitive to express the desired texture layout. This will require supporting Nd
+    indices in BufferLoad and BufferStore in CodegenOpenCL, and ensuring Nd allocations for
+    texture are correctly routed to the AllocateTexture packed function in the OpenCL DeviceAPI.
+*/
 struct BufferDescriptor {
   enum class MemoryLayout {
     /*! \brief One dimensional buffer in row-major layout*/
@@ -345,6 +360,10 @@ struct BufferDescriptor {
      *         e.g. image2d[height=O, width=IHW]
      */
     kImage2DWeight,
+    /*! \brief Two dimensional texture w/ height = axis[1]
+     *         e.g. image2d[height=NH, width=WC]
+     */
+    kImage2DNHWC,
   };
   BufferDescriptor() = default;
   explicit BufferDescriptor(Optional<String> scope) : layout(MemoryLayoutFromScope(scope)) {}
@@ -420,35 +439,85 @@ class OpenCLTimerNode : public TimerNode {
  public:
   // Timer start
   virtual void Start() {
-    cl::OpenCLWorkspace::Global()->GetEventQueue(dev_).clear();
-    this->duration = 0;
+    if (count_timer_execs == 0) {
+      cl::OpenCLWorkspace::Global()->GetEventQueue(dev_).clear();
+      this->duration = 0;
+      // Very first call of Start() leads to the recreation of
+      // OpenCL command queue in profiling mode. This allows to run profile after inference.
+      recreateCommandQueue();
+    }
+    ++count_timer_execs;
+    // set new first idx in event queue
+    if (event_start_idxs.size() < count_timer_execs) {
+      event_start_idxs.push_back(0);
+    }
   }
   // Timer stop
   virtual void Stop() {
     std::vector<cl_event> evt_queue = cl::OpenCLWorkspace::Global()->GetEventQueue(dev_);
     cl_ulong start, end;
-    OPENCL_CALL(clWaitForEvents(1, &(cl::OpenCLWorkspace::Global()->GetEventQueue(dev_).back())));
-    for (auto& kevt : evt_queue) {
-      OPENCL_CALL(clGetEventProfilingInfo(kevt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong),
-                                          &start, nullptr));
-      OPENCL_CALL(
-          clGetEventProfilingInfo(kevt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, nullptr));
-      this->duration += (end - start);
+    size_t start_idx = event_start_idxs[count_timer_execs - 1];
+
+    if (cl::OpenCLWorkspace::Global()->GetEventQueue(dev_).size() > 0) {
+      OPENCL_CALL(clWaitForEvents(1, &(cl::OpenCLWorkspace::Global()->GetEventQueue(dev_).back())));
+      for (size_t i = start_idx; i < evt_queue.size(); ++i) {
+        auto& kevt = evt_queue[i];
+        OPENCL_CALL(clGetEventProfilingInfo(kevt, CL_PROFILING_COMMAND_START, sizeof(cl_ulong),
+                                            &start, nullptr));
+        OPENCL_CALL(clGetEventProfilingInfo(kevt, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end,
+                                            nullptr));
+        this->duration += (end - start);
+      }
     }
+    // update event index for current call nesting
+    event_start_idxs[count_timer_execs - 1] = evt_queue.size();
+    --count_timer_execs;
   }
   virtual int64_t SyncAndGetElapsedNanos() { return this->duration; }
   // destructor
-  virtual ~OpenCLTimerNode() {}
+  virtual ~OpenCLTimerNode() {
+    // Profiling session ends, recreate clCommandQueue in non-profiling mode
+    // This will disable collection of cl_events in case of executing inference after profile
+    if (count_timer_execs == 0) {
+      recreateCommandQueue();
+      event_start_idxs.clear();
+    }
+  }
   // constructor
   OpenCLTimerNode() {}
   explicit OpenCLTimerNode(Device dev) : dev_(dev) {}
 
   static constexpr const char* _type_key = "OpenCLTimerNode";
+  static size_t count_timer_execs;
+  static std::vector<size_t> event_start_idxs;
   TVM_DECLARE_FINAL_OBJECT_INFO(OpenCLTimerNode, TimerNode);
 
  private:
   int64_t duration;
   Device dev_;
+
+  void recreateCommandQueue() {
+    cl_command_queue_properties prop;
+
+    if (!cl::OpenCLWorkspace::Global()->IsProfiling(dev_)) {
+      prop = CL_QUEUE_PROFILING_ENABLE;
+    } else {
+      prop = 0;
+    }
+
+    auto queue = cl::OpenCLWorkspace::Global()->GetQueue(dev_);
+
+    OPENCL_CALL(clFlush(queue));
+    OPENCL_CALL(clFinish(queue));
+    OPENCL_CALL(clReleaseCommandQueue(queue));
+
+    cl_int err_code;
+    cl_device_id did = cl::OpenCLWorkspace::Global()->devices[dev_.device_id];
+    auto profiling_queue =
+        clCreateCommandQueue(cl::OpenCLWorkspace::Global()->context, did, prop, &err_code);
+    OPENCL_CHECK_ERROR(err_code);
+    cl::OpenCLWorkspace::Global()->queues[dev_.device_id] = profiling_queue;
+  }
 };
 }  // namespace runtime
 }  // namespace tvm

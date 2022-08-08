@@ -28,14 +28,24 @@ from .expr import Select, BufferLoad, ProducerLoad, Load, Ramp, Broadcast, Shuff
 from .expr import Call, CallEffectKind, Let, IterVar, CommReducer, Any
 
 from .stmt import Stmt, LetStmt, AssertStmt, ForKind, For, While
-from .stmt import BufferStore, BufferRealize, Store, ProducerStore, Allocate, AttrStmt
+from .stmt import (
+    BufferStore,
+    BufferRealize,
+    Store,
+    ProducerStore,
+    Allocate,
+    AllocateConst,
+    AttrStmt,
+    DeclBuffer,
+)
+
 from .stmt import ProducerRealize, SeqStmt
 from .stmt import IfThenElse, Evaluate, Prefetch, stmt_seq, stmt_list
 from .stmt import BufferRegion, MatchBufferRegion, Block, BlockRealize
 
-from .function import PrimFunc, TensorIntrin
+from .function import PrimFunc, TensorIntrin, IndexMap
 
-from .op import call_packed, call_intrin, call_pure_extern, call_extern
+from .op import call_packed, call_cpacked, call_intrin, call_pure_extern, call_extern
 from .op import call_llvm_intrin, call_llvm_pure_intrin, ret, all, any, min_value, max_value, trace
 from .op import exp, exp2, exp10, log, log2, log10, log1p, ldexp, clz
 from .op import sin, sinh, asin, asinh
@@ -44,7 +54,7 @@ from .op import tan, tanh, atan, atan2, atanh
 from .op import erf, sigmoid, sqrt, rsqrt, floor, ceil, hypot
 from .op import trunc, abs, round, nextafter, nearbyint, power, popcount, fmod, if_then_else
 from .op import isnan, isfinite, isinf, copysign
-from .op import div, indexdiv, indexmod, truncdiv, truncmod, floordiv, floormod
+from .op import div, indexdiv, indexmod, truncdiv, truncmod, floordiv, floormod, ceildiv
 from .op import comm_reducer, min, max, sum
 from .op import q_multiply_shift
 

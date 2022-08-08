@@ -67,7 +67,7 @@ void CodeGenMetal::AddFunction(const PrimFunc& f) {
 
   // Buffer arguments
   size_t num_buffer = 0;
-  int limit = target_->GetAttr<Integer>("max_function_args").value();
+  int limit = target_->GetAttr<Integer>("max_function_args").value().IntValue();
   if (static_cast<int>(f->params.size()) > limit) {
     LOG(WARNING) << "Probably you won't be able to execute your kernel due to high number of "
                     "buffers in the kernel";
@@ -175,6 +175,11 @@ void CodeGenMetal::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   if (t.is_handle()) {
     ICHECK_EQ(lanes, 1) << "do not yet support vector types";
     os << "void*";
+    return;
+  }
+
+  if (t.is_void()) {
+    os << "void";
     return;
   }
   if (t == DataType::Bool()) {

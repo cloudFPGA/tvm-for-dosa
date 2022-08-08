@@ -26,7 +26,7 @@ export TZ=Etc/UTC
 sudo ln -snf /usr/share/zoneinfo/$TZ /etc/localtime
 echo $TZ > /etc/timezone
 
-sudo apt-get install -y --no-install-recommends \
+sudo apt-install-and-clear -y --no-install-recommends \
      libsdl2-dev ca-certificates gnupg software-properties-common wget \
      git cmake ninja-build gperf \
      ccache dfu-util device-tree-compiler wget \
@@ -36,10 +36,11 @@ sudo apt-get install -y --no-install-recommends \
 wget --no-verbose https://apt.kitware.com/keys/kitware-archive-latest.asc
 sudo apt-key add kitware-archive-latest.asc
 
-sudo apt-add-repository 'deb https://apt.kitware.com/ubuntu/ bionic main'
+echo deb https://apt.kitware.com/ubuntu/ bionic main\
+     >> /etc/apt/sources.list.d/kitware.list
 sudo apt-get update
 
-sudo apt-get install -y cmake
+sudo apt-install-and-clear -y cmake
 
 pip3 install west
 
@@ -63,5 +64,9 @@ chmod o+rwx zephyr/.cache
 
 #/opt/west/bin/pip3 install -r /opt/zephyrproject/zephyr/scripts/requirements.txt
 pip3 install -r /opt/zephyrproject/zephyr/scripts/requirements.txt
+
+# the requirements above overwrite junintparser with an older version, but it is not
+# used so overwrite it again with the correct version
+pip3 install junitparser==2.4.2
 
 bash /install/ubuntu_install_zephyr_sdk.sh /opt/zephyr-sdk

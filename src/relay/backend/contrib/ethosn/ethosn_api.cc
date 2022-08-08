@@ -45,6 +45,14 @@ namespace relay {
 namespace contrib {
 namespace ethosn {
 
+sl::TensorInfo EthosnAPI::DefaultInputTensor(const Expr& expr) {
+  Call call = Downcast<Call>(expr);
+  const auto* dtype = call->args[0]->checked_type().as<TensorTypeNode>();
+  sl::DataType data_type;
+  Tvm2Npu(dtype->dtype, &data_type);
+  return sl::TensorInfo({}, data_type, sl::DataFormat::NHWC, {});
+}
+
 EthosnError EthosnAPI::QnnConv2d(const Expr& expr, ConvolutionParams* params) {
   Call requantize = Downcast<Call>(expr);
   Call bias_add = Downcast<Call>(requantize->args[0]);
@@ -82,13 +90,13 @@ EthosnError EthosnAPI::QnnConv2d(const Expr& expr, ConvolutionParams* params) {
   err += AsConstant(requantize->args[3], &output_scale);
 
   // Convert quantization params
-  sl::QuantizationInfo data_q_info;
+  sl::QuantizationInfo input_q_info;
   sl::QuantizationInfo weights_q_info;
   sl::QuantizationInfo bias_q_info;
   sl::QuantizationInfo output_q_info;
-  err += Tvm2Npu(input_zero_point, input_scale, qaxis, &data_q_info);
+  err += Tvm2Npu(input_zero_point, input_scale, qaxis, &input_q_info);
   err += Tvm2Npu(kernel_zero_point, kernel_scale, qaxis, &weights_q_info);
-  std::valarray<float> bias = data_q_info.GetScales() * weights_q_info.GetScales();
+  std::valarray<float> bias = input_q_info.GetScales() * weights_q_info.GetScales();
   err += Tvm2Npu(0, bias, 3, &bias_q_info);
   err += Tvm2Npu(output_zero_point, output_scale, &output_q_info);
 
@@ -108,7 +116,7 @@ EthosnError EthosnAPI::QnnConv2d(const Expr& expr, ConvolutionParams* params) {
   sl::Stride stride;
   err += Tvm2Npu(conv_attr->strides, &stride);
   // Dilation is not supported
-  std::array<uint32_t, 4> dilation = {1, 1, 1, 1};
+  std::array<uint32_t, 2> dilation = {1, 1};
   AsArray(conv_attr->dilation, &dilation);
   if (conv_attr->dilation.size() != 2 || dilation[0] != 1 || dilation[1] != 1) {
     err +=
@@ -117,19 +125,19 @@ EthosnError EthosnAPI::QnnConv2d(const Expr& expr, ConvolutionParams* params) {
   // Create convolution info
   params->conv_info = sl::ConvolutionInfo(padding, stride, output_q_info);
 
-  // Create data info
-  const TensorTypeNode* data_dtype;
+  // Create input info
+  const TensorTypeNode* input_ttype;
   if (pad.defined()) {
-    data_dtype = pad->args[0]->checked_type().as<TensorTypeNode>();
+    input_ttype = pad->args[0]->checked_type().as<TensorTypeNode>();
   } else {
-    data_dtype = conv->args[0]->checked_type().as<TensorTypeNode>();
+    input_ttype = conv->args[0]->checked_type().as<TensorTypeNode>();
   }
-  sl::TensorShape activation_tensor_shape;
-  sl::DataType activation_data_type;
-  err += Tvm2Npu(data_dtype->shape, &activation_tensor_shape);
-  err += Tvm2Npu(data_dtype->dtype, &activation_data_type);
-  params->activation_info = sl::TensorInfo(activation_tensor_shape, activation_data_type,
-                                           sl::DataFormat::NHWC, data_q_info);
+  sl::TensorShape input_tensor_shape;
+  sl::DataType input_data_type;
+  err += Tvm2Npu(input_ttype->shape, &input_tensor_shape);
+  err += Tvm2Npu(input_ttype->dtype, &input_data_type);
+  params->input_info =
+      sl::TensorInfo(input_tensor_shape, input_data_type, sl::DataFormat::NHWC, input_q_info);
 
   // Create weights info
   const auto* weights_dtype = conv->args[1]->checked_type().as<TensorTypeNode>();
@@ -149,6 +157,11 @@ EthosnError EthosnAPI::QnnConv2d(const Expr& expr, ConvolutionParams* params) {
       {1, 1, 1, params->is_depthwise ? weights_tensor_shape[2] : weights_tensor_shape[3]},
       sl::DataType::INT32_QUANTIZED, sl::DataFormat::NHWC, bias_q_info);
   params->raw_bias = bias_add->args[1].as<ConstantNode>()->data->data;
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(requantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = output_q_info;
+  params->output_info = output_tensor_info;
 
   return err;
 }
@@ -213,12 +226,19 @@ EthosnError EthosnAPI::QnnFullyConnected(const Expr& expr, FullyConnectedParams*
                      sl::DataFormat::NHWC, bias_q_info);
   params->raw_bias = bias_add->args[1].as<ConstantNode>()->data->data;
 
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(requantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_Dimensions = {data_tensor_shape[0], 1, 1, weights_tensor_shape[0]};
+  output_tensor_info.m_QuantizationInfo = output_q_info;
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
-EthosnError EthosnAPI::Pool2d(const Call& pool, Array<IndexExpr> size, Array<IndexExpr> strides,
-                              Array<IndexExpr> padding, sl::PoolingType pooling_type,
-                              sl::PoolingInfo* pool_info, sl::TensorInfo* input_info,
+EthosnError EthosnAPI::Pool2d(const Call& input, const Call& output, Array<IndexExpr> size,
+                              Array<IndexExpr> strides, Array<IndexExpr> padding,
+                              sl::PoolingType pooling_type, sl::PoolingInfo* pool_info,
+                              sl::TensorInfo* input_info, sl::TensorInfo* output_info,
                               std::string layout) {
   uint32_t npu_sizex, npu_sizey;
   sl::Padding npu_padding;
@@ -230,7 +250,7 @@ EthosnError EthosnAPI::Pool2d(const Call& pool, Array<IndexExpr> size, Array<Ind
                                pooling_type);
 
   // Create input info
-  const auto* input_dtype = pool->args[0]->checked_type().as<TensorTypeNode>();
+  const auto* input_dtype = input->args[0]->checked_type().as<TensorTypeNode>();
   sl::TensorShape input_tensor_shape;
   sl::DataType input_data_type;
   sl::DataFormat input_data_format;
@@ -242,14 +262,21 @@ EthosnError EthosnAPI::Pool2d(const Call& pool, Array<IndexExpr> size, Array<Ind
   }
   *input_info = sl::TensorInfo(input_tensor_shape, input_data_type, input_data_format,
                                input_info->m_QuantizationInfo);
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(output->checked_type(), &output_tensor_info);
+  // output quantization is the same as the input
+  output_tensor_info.m_QuantizationInfo = input_info->m_QuantizationInfo;
+  *output_info = output_tensor_info;
   return err;
 }
 
 EthosnError EthosnAPI::MaxPool2D(const Expr& expr, MaxPool2DParams* params) {
   Call pool = Downcast<Call>(expr);
   const auto pool_attrs = pool->attrs.as<MaxPool2DAttrs>();
-  return Pool2d(pool, pool_attrs->pool_size, pool_attrs->strides, pool_attrs->padding,
-                sl::PoolingType::MAX, &params->pool_info, &params->input_info, pool_attrs->layout);
+  return Pool2d(pool, pool, pool_attrs->pool_size, pool_attrs->strides, pool_attrs->padding,
+                sl::PoolingType::MAX, &params->pool_info, &params->input_info, &params->output_info,
+                pool_attrs->layout);
 }
 
 EthosnError EthosnAPI::AvgPool2D(const Expr& expr, AvgPool2DParams* params) {
@@ -257,8 +284,9 @@ EthosnError EthosnAPI::AvgPool2D(const Expr& expr, AvgPool2DParams* params) {
   Call pool = Downcast<Call>(cast_0->args[0]);
   Call cast_1 = Downcast<Call>(pool->args[0]);
   const auto pool_attrs = pool->attrs.as<AvgPool2DAttrs>();
-  return Pool2d(cast_1, pool_attrs->pool_size, pool_attrs->strides, pool_attrs->padding,
-                sl::PoolingType::AVG, &params->pool_info, &params->input_info, pool_attrs->layout);
+  return Pool2d(cast_1, cast_0, pool_attrs->pool_size, pool_attrs->strides, pool_attrs->padding,
+                sl::PoolingType::AVG, &params->pool_info, &params->input_info, &params->output_info,
+                pool_attrs->layout);
 }
 
 EthosnError EthosnAPI::Reshape(const Expr& expr, ReshapeParams* params) {
@@ -266,6 +294,11 @@ EthosnError EthosnAPI::Reshape(const Expr& expr, ReshapeParams* params) {
   Call reshape = Downcast<Call>(expr);
   const auto* input_dtype = reshape->args[0]->checked_type().as<TensorTypeNode>();
   const auto& reshape_attrs = reshape->attrs.as<ReshapeAttrs>();
+
+  if (reshape_attrs->newshape.size() > params->new_shape.size()) {
+    return EthosnError(ErrStrm() << "reshape dimension=" << reshape_attrs->newshape.size()
+                                 << ", reshape dimension must be <= " << params->new_shape.size());
+  }
 
   sl::TensorShape input_tensor_shape = {1, 1, 1, 1};
   sl::DataType input_data_type;
@@ -310,6 +343,11 @@ EthosnError EthosnAPI::Reshape(const Expr& expr, ReshapeParams* params) {
       sl::TensorInfo(input_tensor_shape, input_data_type, params->input_info.m_DataFormat,
                      params->input_info.m_QuantizationInfo);
 
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(reshape->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = params->input_info.m_QuantizationInfo;
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
@@ -331,9 +369,11 @@ EthosnError EthosnAPI::Addition(const Expr& expr, AdditionParams* params) {
 
   sl::QuantizationInfo lhs_q_info;
   sl::QuantizationInfo rhs_q_info;
+  sl::QuantizationInfo output_q_info;
   err += Tvm2Npu(lhs_zero_point, lhs_scale, &lhs_q_info);
   err += Tvm2Npu(rhs_zero_point, rhs_scale, &rhs_q_info);
-  err += Tvm2Npu(output_zero_point, output_scale, &params->output_quantization_info);
+  err += Tvm2Npu(output_zero_point, output_scale, &output_q_info);
+  params->output_quantization_info = output_q_info;
 
   // Create input info
   const auto* lhs_dtype = call->args[0]->checked_type().as<TensorTypeNode>();
@@ -351,6 +391,12 @@ EthosnError EthosnAPI::Addition(const Expr& expr, AdditionParams* params) {
   err += Tvm2Npu(rhs_dtype->dtype, &rhs_data_type);
   params->rhs_info =
       sl::TensorInfo(rhs_tensor_shape, rhs_data_type, sl::DataFormat::NHWC, rhs_q_info);
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(call->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = output_q_info;
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
@@ -359,6 +405,77 @@ EthosnError EthosnAPI::Sigmoid(const Expr& expr, SigmoidParams* params) {
   Call sigmoid = Downcast<Call>(quantize->args[0]);
   Call dequantize = Downcast<Call>(sigmoid->args[0]);
 
+  // Create input info
+  const auto* input_dtype = dequantize->args[0]->checked_type().as<TensorTypeNode>();
+  sl::TensorShape input_tensor_shape = {1, 1, 1, 1};
+  sl::DataType input_tensor_dtype;
+  EthosnError err = Tvm2Npu(input_dtype->shape, &input_tensor_shape);
+  err += Tvm2Npu(input_dtype->dtype, &input_tensor_dtype);
+  float input_sc;
+  int input_zp;
+  err += AsConstant(dequantize->args[2], &input_zp);
+  err += AsConstant(dequantize->args[1], &input_sc);
+  float output_sc;
+  int output_zp;
+  err += AsConstant(quantize->args[2], &output_zp);
+  err += AsConstant(quantize->args[1], &output_sc);
+
+  auto test_zp = input_dtype->dtype.is_int() ? -128 : 0;
+  if (output_zp != test_zp || output_sc != 1.0f / 256.0f) {
+    err += EthosnError(ErrStrm() << "output quantization params=(" << output_zp << ", " << output_sc
+                                 << "), must = (" << test_zp << ", 1/256)");
+  }
+
+  params->input_info = sl::TensorInfo(input_tensor_shape, input_tensor_dtype, sl::DataFormat::NHWC,
+                                      sl::QuantizationInfo(input_zp, input_sc));
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(quantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
+  params->output_info = output_tensor_info;
+
+  return err;
+}
+
+EthosnError EthosnAPI::Mean(const Expr& expr, MeanParams* params) {
+  Call requantize = Downcast<Call>(expr);
+  Call mean = Downcast<Call>(requantize->args[0]);
+  Call cast_0 = Downcast<Call>(mean->args[0]);
+
+  // Create input info
+  const auto* input_ttype = cast_0->args[0]->checked_type().as<TensorTypeNode>();
+  const auto* output_ttype = requantize->checked_type().as<TensorTypeNode>();
+  sl::TensorShape input_tensor_shape = {1, 1, 1, 1};
+  sl::DataType input_tensor_dtype;
+  EthosnError err = Tvm2Npu(input_ttype->shape, &input_tensor_shape);
+  err += Tvm2Npu(input_ttype->dtype, &input_tensor_dtype);
+  sl::TensorShape output_tensor_shape = {1, 1, 1, 1};
+  sl::DataType output_tensor_dtype;
+  err += Tvm2Npu(output_ttype->shape, &output_tensor_shape);
+  err += Tvm2Npu(output_ttype->dtype, &output_tensor_dtype);
+  float input_sc;
+  int input_zp;
+  err += AsConstant(requantize->args[2], &input_zp);
+  err += AsConstant(requantize->args[1], &input_sc);
+  params->input_info = sl::TensorInfo(input_tensor_shape, input_tensor_dtype, sl::DataFormat::NHWC,
+                                      sl::QuantizationInfo(input_zp, input_sc));
+
+  float output_sc;
+  int output_zp;
+  err += AsConstant(requantize->args[3], &output_sc);
+  err += AsConstant(requantize->args[4], &output_zp);
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(requantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
+  params->output_info = output_tensor_info;
+
+  return err;
+}
+
+EthosnError EthosnAPI::Tanh(const Expr& expr, TanhParams* params) {
+  Call quantize = Downcast<Call>(expr);
+  Call tanh = Downcast<Call>(quantize->args[0]);
+  Call dequantize = Downcast<Call>(tanh->args[0]);
   // Create input info
   const auto* input_dtype = quantize->checked_type().as<TensorTypeNode>();
   sl::TensorShape input_tensor_shape = {1, 1, 1, 1};
@@ -373,32 +490,56 @@ EthosnError EthosnAPI::Sigmoid(const Expr& expr, SigmoidParams* params) {
   int output_zp;
   err += AsConstant(quantize->args[2], &output_zp);
   err += AsConstant(quantize->args[1], &output_sc);
-  auto test_zp = input_dtype->dtype.is_int() ? -128 : 0;
-  if (output_zp != test_zp || output_sc != 1.0f / 256.0f) {
+  auto test_zp = input_dtype->dtype.is_uint() ? 128 : 0;
+  if (output_zp != test_zp || output_sc != 0.0078125f) {
     err += EthosnError(ErrStrm() << "output quantization params=(" << output_zp << ", " << output_sc
                                  << "), must = (" << test_zp << ", 1/256)");
   }
   params->input_info = sl::TensorInfo(input_tensor_shape, input_tensor_dtype, sl::DataFormat::NHWC,
                                       sl::QuantizationInfo(input_zp, input_sc));
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(quantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
+  params->output_info = output_tensor_info;
+
   return err;
 }
-EthosnError EthosnAPI::Mean(const Expr& expr, MeanParams* params) {
-  Call requantize = Downcast<Call>(expr);
-  Call mean = Downcast<Call>(requantize->args[0]);
-  Call cast_0 = Downcast<Call>(mean->args[0]);
 
-  // Create input info
-  const auto* input_dtype = cast_0->args[0]->checked_type().as<TensorTypeNode>();
+EthosnError EthosnAPI::LeakyReLU(const Expr& expr, LeakyReLUParams* params) {
+  Call quantize = Downcast<Call>(expr);
+  Call leaky_relu = Downcast<Call>(quantize->args[0]);
+  Call dequantize = Downcast<Call>(leaky_relu->args[0]);
+
+  const auto* input_dtype = quantize->checked_type().as<TensorTypeNode>();
   sl::TensorShape input_tensor_shape = {1, 1, 1, 1};
   sl::DataType input_tensor_dtype;
   EthosnError err = Tvm2Npu(input_dtype->shape, &input_tensor_shape);
   err += Tvm2Npu(input_dtype->dtype, &input_tensor_dtype);
   float input_sc;
   int input_zp;
-  err += AsConstant(requantize->args[2], &input_zp);
-  err += AsConstant(requantize->args[1], &input_sc);
+  err += AsConstant(dequantize->args[2], &input_zp);
+  err += AsConstant(dequantize->args[1], &input_sc);
+  float output_sc;
+  int output_zp;
+  err += AsConstant(quantize->args[2], &output_zp);
+  err += AsConstant(quantize->args[1], &output_sc);
+
+  const auto* attrs = leaky_relu->attrs.as<LeakyReluAttrs>();
+  double alpha = attrs->alpha;
+  if (alpha >= 1.0f || alpha <= 0.0f) {
+    err += EthosnError(
+        ErrStrm() << "leaky relu alpha must be less than 1 and greater than 0, but was " << alpha);
+    return err;
+  }
+  params->leaky_relu_info = sl::LeakyReluInfo(alpha, sl::QuantizationInfo(output_zp, output_sc));
   params->input_info = sl::TensorInfo(input_tensor_shape, input_tensor_dtype, sl::DataFormat::NHWC,
                                       sl::QuantizationInfo(input_zp, input_sc));
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(quantize->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
+  params->output_info = output_tensor_info;
 
   return err;
 }
@@ -408,11 +549,11 @@ EthosnError EthosnAPI::Concatenate(const Expr& expr, ConcatenateParams* params) 
   const auto& attrs = call->attrs.as<ConcatenateAttrs>();
   params->concat_info.m_Axis = attrs->axis;
 
-  float output_s;
+  float output_sc;
   int output_zp;
-  EthosnError err = AsConstant(call->args[3], &output_s);
+  EthosnError err = AsConstant(call->args[3], &output_sc);
   err += AsConstant(call->args[4], &output_zp);
-  params->concat_info.m_OutputQuantizationInfo = sl::QuantizationInfo(output_zp, output_s);
+  params->concat_info.m_OutputQuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
 
   auto input_scales = call->args[1].as<TupleNode>()->fields;
   auto input_zero_points = call->args[2].as<TupleNode>()->fields;
@@ -435,6 +576,12 @@ EthosnError EthosnAPI::Concatenate(const Expr& expr, ConcatenateParams* params) 
                                                     sl::QuantizationInfo(zp, scale)));
     index++;
   }
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(call->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = sl::QuantizationInfo(output_zp, output_sc);
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
@@ -467,6 +614,16 @@ EthosnError EthosnAPI::Split(const Expr& expr, SplitParams* params) {
     int axis_size = input_tensor_shape[attrs->axis];
     params->split_info.m_Sizes.push_back(axis_size - last_index);
   }
+
+  Array<Type> output_tensors = call->checked_type().as<TupleTypeNode>()->fields;
+  std::vector<sl::TensorInfo> output_infos = {};
+  for (auto output_ttype : output_tensors) {
+    sl::TensorInfo output_tensor_info;
+    err += Tvm2Npu(output_ttype, &output_tensor_info);
+    output_tensor_info.m_QuantizationInfo = params->input_info.m_QuantizationInfo;
+    output_infos.push_back(output_tensor_info);
+  }
+  params->output_infos = output_infos;
   return err;
 }
 
@@ -485,11 +642,14 @@ EthosnError EthosnAPI::DepthToSpace(const Expr& expr, DepthToSpaceParams* params
   EthosnError err = Tvm2Npu(input_dtype->shape, &input_tensor_shape);
   err += Tvm2Npu(input_dtype->dtype, &input_data_type);
   err += Tvm2Npu(attrs->layout, &input_data_format);
-  if (input_data_format != sl::DataFormat::NHWC) {
-    err += EthosnError(ErrStrm() << "layout=" << attrs->layout << ", layout must = NHWC");
-  }
   params->input_info = sl::TensorInfo(input_tensor_shape, input_data_type, input_data_format,
                                       params->input_info.m_QuantizationInfo);
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(call->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = params->input_info.m_QuantizationInfo;
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
@@ -507,6 +667,12 @@ EthosnError EthosnAPI::Relu(const Expr& expr, ReluParams* params) {
   params->input_info =
       sl::TensorInfo(input_tensor_shape, input_data_type, params->input_info.m_DataFormat,
                      params->input_info.m_QuantizationInfo);
+
+  sl::TensorInfo output_tensor_info;
+  err += Tvm2Npu(call->checked_type(), &output_tensor_info);
+  output_tensor_info.m_QuantizationInfo = params->input_info.m_QuantizationInfo;
+  params->output_info = output_tensor_info;
+
   return err;
 }
 
@@ -517,11 +683,11 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<IndexExpr>& padding, sl::Padding* npu
   }
   switch (padding.size()) {
     case 1:
-      *npu_padding = sl::Padding(dim[0], dim[0], dim[0], dim[0]);
+      *npu_padding = sl::Padding(dim[3], dim[3], dim[3], dim[3]);
       break;
     case 2:
       // Height, width -> top, bottom, left, right
-      *npu_padding = sl::Padding(dim[0], dim[0], dim[1], dim[1]);
+      *npu_padding = sl::Padding(dim[3], dim[3], dim[2], dim[2]);
       break;
     case 4:
       // Top, left, bottom, right -> top, bottom, left, right
@@ -538,7 +704,7 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<IndexExpr>& strides, sl::Stride* npu_
   if (strides.size() != 2) {
     return EthosnError(ErrStrm() << "stride size=" << strides.size() << ", stride size must = 2");
   }
-  std::array<uint32_t, 4> dim;
+  std::array<uint32_t, 2> dim;
   if (EthosnError err = AsArray<IndexExpr, uint32_t>(strides, &dim)) {
     return err;
   }
@@ -550,7 +716,7 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<IndexExpr>& size, uint32_t* x, uint32
   if (size.size() != 2) {
     return EthosnError(ErrStrm() << "dimensions=" << size.size() << ", dimensions must = 2");
   }
-  std::array<uint32_t, 4> dim;
+  std::array<uint32_t, 2> dim;
   if (EthosnError err = AsArray<IndexExpr, uint32_t>(size, &dim)) {
     return err;
   }
@@ -560,8 +726,8 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<IndexExpr>& size, uint32_t* x, uint32
 }
 
 EthosnError EthosnAPI::Tvm2Npu(const std::string& dformat, sl::DataFormat* data_format) {
+  *data_format = sl::DataFormat::NCHW;
   if (dformat == "NCHW") {
-    *data_format = sl::DataFormat::NCHW;
     return EthosnError();
   } else if (dformat == "NHWC") {
     *data_format = sl::DataFormat::NHWC;
@@ -586,12 +752,12 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<IndexExpr>& shape, sl::TensorShape* n
 }
 
 EthosnError EthosnAPI::Tvm2Npu(const tvm::DataType& dtype, sl::DataType* data_type) {
+  *data_type = sl::DataType::INT8_QUANTIZED;
   if (dtype.is_scalar() == 1) {
     if (dtype.is_uint() && dtype.bits() == 8) {
       *data_type = sl::DataType::UINT8_QUANTIZED;
       return EthosnError();
     } else if (dtype.is_int() && dtype.bits() == 8) {
-      *data_type = sl::DataType::INT8_QUANTIZED;
       return EthosnError();
     } else if (dtype.is_int() && dtype.bits() == 32) {
       *data_type = sl::DataType::INT32_QUANTIZED;
@@ -644,14 +810,27 @@ EthosnError EthosnAPI::Tvm2Npu(const Array<Array<Integer>>& padding, sl::Padding
   return EthosnError();
 }
 
+EthosnError EthosnAPI::Tvm2Npu(const tvm::Type& type, sl::TensorInfo* npu_tinfo) {
+  const TensorTypeNode* ttype = type.as<TensorTypeNode>();
+  ICHECK(ttype) << "Expected TensorTypeNode but was " << ttype->GetTypeKey();
+
+  sl::TensorShape shape = {1, 1, 1, 1};
+  sl::DataType data_type;
+  EthosnError err = Tvm2Npu(ttype->shape, &shape);
+  err += Tvm2Npu(ttype->dtype, &data_type);
+  *npu_tinfo = sl::TensorInfo(shape, data_type, sl::DataFormat::NHWC, {});
+  return err;
+}
+
 // Convert an array of IntImmNodes into ValueT
 // IndexT type of Array indexing variable
 // ValueT type of resulting value
-template <typename IndexT, typename ValueT>
-EthosnError EthosnAPI::AsArray(const Array<IndexT>& arr, std::array<ValueT, 4>* v) {
-  if (arr.size() > 4)
-    return EthosnError(ErrStrm() << "dimensions=" << arr.size() << ", dimensions must be <= 4");
-  for (size_t i = 0; i < std::min(arr.size(), 4ul); i++) {
+// N The size of the output array
+template <typename IndexT, typename ValueT, size_t N>
+EthosnError EthosnAPI::AsArray(const Array<IndexT>& arr, std::array<ValueT, N>* v) {
+  if (arr.size() > N)
+    return EthosnError(ErrStrm() << "dimensions=" << arr.size() << ", dimensions must be <= " << N);
+  for (size_t i = 0; i < arr.size(); i++) {
     const PrimExpr& a = arr[i];
     const auto* intImm = a.as<IntImmNode>();
     if (intImm->value > std::numeric_limits<ValueT>::max()) {
@@ -684,6 +863,7 @@ EthosnError EthosnAPI::AsConstant(const Expr& expr, std::valarray<float>* out) {
 // Get a T from a constant represented by a NDArray.
 template <typename T>
 EthosnError EthosnAPI::AsConstant(const Expr& expr, T* out) {
+  *out = {0};
   if (!expr->IsInstance<ConstantNode>()) {
     return EthosnError("expected constant data");
   }

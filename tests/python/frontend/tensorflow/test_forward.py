@@ -22,6 +22,7 @@ This article is a test script to test tensorflow operator with Relay.
 """
 from __future__ import print_function
 import threading
+import platform
 import numpy as np
 import pytest
 
@@ -147,6 +148,7 @@ def run_tvm_graph(
         outputs=out_names,
         convert_config=convert_config,
     )
+
     dev = tvm.device(target, 0)
     if mode == "debug":
         inputs = []
@@ -565,6 +567,7 @@ def _test_convolution(
             )
 
 
+@pytest.mark.skip(reason="See https://github.com/apache/tvm/issues/10275")
 @tvm.testing.uses_gpu
 def test_forward_convolution():
     if is_gpu_available():
@@ -2420,10 +2423,11 @@ def _test_sparse_to_dense(sparse_indices, sparse_values, default_value, output_s
         )
         oshape = tf.constant(output_shape, shape=output_shape.shape, dtype=str(output_shape.dtype))
 
+        # Output shape depends on a dynamic input, use VM.
         if default_value == None:
             output = tf.sparse_to_dense(indices, oshape, values)
             compare_tf_with_tvm(
-                [sparse_indices, sparse_values], ["indices:0", "values:0"], output.name
+                [sparse_indices, sparse_values], ["indices:0", "values:0"], output.name, mode="vm"
             )
         else:
             dv = tf.placeholder(shape=(), dtype=str(default_value.dtype), name="default_value")
@@ -2432,6 +2436,7 @@ def _test_sparse_to_dense(sparse_indices, sparse_values, default_value, output_s
                 [sparse_indices, sparse_values, default_value],
                 ["indices:0", "values:0", "default_value:0"],
                 output.name,
+                mode="vm",
             )
 
 
@@ -2493,7 +2498,8 @@ def _test_sparse_to_dense_v2(indices, values, A_shape, dtype, default_value=None
 
         result = tf.sparse.to_dense(A_sp, default_value=default_value)
 
-        compare_tf_with_tvm([], [], result.name)
+        # The output shape depends on a dynamic input, use VM.
+        compare_tf_with_tvm([], [], result.name, mode="vm")
 
 
 def test_forward_sparse_to_dense_v2():
@@ -3350,7 +3356,6 @@ def test_forward_crop_and_resize():
     _test_forward_crop_and_resize([1, 11, 11, 3], [[0.3, 0.3, 1, 1]], [0], [21, 21])
     _test_forward_crop_and_resize([1, 41, 41, 3], [[0.2, 0.4, 0.8, 0.8]], [0], [21, 11])
     _test_forward_crop_and_resize([1, 100, 100, 3], [[0, 0, 0.9, 0.9]], [0], [30, 30])
-    _test_forward_crop_and_resize([1, 224, 224, 3], [[0.1, 0.2, 1, 1]], [0], [9, 9])
     _test_forward_crop_and_resize([1, 249, 249, 3], [[0, 0, 1, 1]], [0], [9, 9])
     _test_forward_crop_and_resize([1, 201, 301, 3], [[0.2, 0.3, 0.7, 0.8]], [0], [51, 51])
     _test_forward_crop_and_resize(
@@ -3359,6 +3364,10 @@ def test_forward_crop_and_resize():
         box_idx=[0, 1],
         crop_size=[5, 5],
     )
+
+    if platform.machine() == "aarch64":
+        pytest.skip("Currently failing on AArch64")
+    _test_forward_crop_and_resize([1, 224, 224, 3], [[0.1, 0.2, 1, 1]], [0], [9, 9])
     _test_forward_crop_and_resize(
         img_shape=[20, 576, 576, 3],
         boxes=[[0, 0, 1, 1], [0, 0, 0.8, 0.8], [0.1, 0.2, 0.9, 1], [0.2, 0, 1, 1]],
@@ -3667,6 +3676,39 @@ def test_forward_range():
 
 
 #######################################################################
+# Einsum
+# -----
+
+
+def _test_einsum(equation, dtype, *shape_of_input_tensors):
+    """Test Einsum Op"""
+
+    with tf.Graph().as_default():
+        inputs_placeholders = []
+        input_data = []
+        for idx, shape in enumerate(shape_of_input_tensors):
+            input_name = f"input_{idx}"
+            inputs_placeholders.append(tf.placeholder(shape=shape, dtype=dtype, name=input_name))
+            input_data.append(np.random.normal(size=shape).astype(dtype))
+
+        result = tf.einsum(equation, *inputs_placeholders)
+
+        compare_tf_with_tvm(input_data, [ph.name for ph in inputs_placeholders], result.name)
+
+
+def test_forward_einsum():
+    for dtype in ["float32"]:
+        _test_einsum("ij,jk->ik", dtype, [2, 3], [3, 5])  # Matmul
+        _test_einsum("ij,jk", dtype, [2, 3], [3, 5])  # Matmul
+        _test_einsum("i,i->", dtype, [2], [2])  # Dot product
+        _test_einsum("i,j->ij", dtype, [3], [5])  # Outer produce
+        _test_einsum("ij->ji", dtype, [2, 3])  # Transpose
+        _test_einsum("ii->i", dtype, [3, 3])  # Diag
+        _test_einsum("ii", dtype, [3, 3])  # Trace of a square matrix
+        _test_einsum("bij,bjk->bik", dtype, [7, 5, 3], [7, 3, 2])  # Batch matmul
+
+
+#######################################################################
 # Pad
 # ---
 
@@ -3769,6 +3811,7 @@ def test_forward_where():
 #######################################################################
 # Inception V3
 # ------------
+@pytest.mark.skip(reason="See https://github.com/apache/tvm/issues/10275")
 def test_forward_inception_v3():
     """test inception V3 model"""
     with tf.Graph().as_default():
@@ -3934,6 +3977,9 @@ def _test_ssd_impl():
                     tvm.testing.assert_allclose(tvm_output[i], tf_output[i], rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.skip(
+    reason="Use of threading module here hides errors, see https://github.com/apache/tvm/pull/10231"
+)
 def test_forward_ssd():
     run_thread = threading.Thread(target=_test_ssd_impl, args=())
     old_stack_size = threading.stack_size(100 * 1024 * 1024)
@@ -5567,7 +5613,7 @@ def _test_unique(n, dtype, is_dyn):
         if is_dyn:
             compare_tf_with_tvm(np_data, "in_data:0", ["Unique:0", "Unique:1"], mode="vm")
         else:
-            compare_tf_with_tvm(None, "", ["Unique:0", "Unique:1"])
+            compare_tf_with_tvm(np_data, "", ["Unique:0", "Unique:1"], mode="vm")
 
 
 def test_forward_unique():
@@ -5602,7 +5648,10 @@ def _test_unique_with_counts(n, dtype, is_dyn):
             )
         else:
             compare_tf_with_tvm(
-                None, "", ["UniqueWithCounts:0", "UniqueWithCounts:1", "UniqueWithCounts:2"]
+                np_data,
+                "",
+                ["UniqueWithCounts:0", "UniqueWithCounts:1", "UniqueWithCounts:2"],
+                mode="vm",
             )
 
 
