@@ -25,6 +25,7 @@
 #include <memory>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "hexagon_buffer.h"
 
@@ -43,7 +44,10 @@ class HexagonBufferManager {
     CHECK(it != hexagon_buffer_map_.end())
         << "Attempt made to free unknown or already freed dataspace allocation";
     CHECK(it->second != nullptr);
-    hexagon_buffer_map_.erase(it);
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      hexagon_buffer_map_.erase(it);
+    }
   }
   /*!
    * \brief Allocate a HexagonBuffer.
@@ -53,15 +57,22 @@ class HexagonBufferManager {
   void* AllocateHexagonBuffer(Args&&... args) {
     auto buf = std::make_unique<HexagonBuffer>(std::forward<Args>(args)...);
     void* ptr = buf->GetPointer();
-    hexagon_buffer_map_.insert({ptr, std::move(buf)});
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      hexagon_buffer_map_.insert({ptr, std::move(buf)});
+    }
     return ptr;
   }
 
   //! \brief Returns whether the HexagonBuffer is in the map.
-  size_t count(void* ptr) { return hexagon_buffer_map_.count(ptr); }
+  size_t count(void* ptr) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    return hexagon_buffer_map_.count(ptr);
+  }
 
   //! \brief Returns an iterator to the HexagonBuffer within the map.
   HexagonBuffer* find(void* ptr) {
+    std::lock_guard<std::mutex> lock(map_mutex_);
     auto it = hexagon_buffer_map_.find(ptr);
     if (it != hexagon_buffer_map_.end()) {
       return it->second.get();
@@ -69,9 +80,30 @@ class HexagonBufferManager {
     return nullptr;
   }
 
+  //! \brief Returns whether the HexagonBufferManager has any allocations.
+  bool empty() {
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    return hexagon_buffer_map_.empty();
+  }
+
+  //! \brief Returns a vector of currently allocated pointers, owned by the manager.
+  // Note - this should only be used by the device API to keep track of what
+  // was in the manager when HexagonDeviceAPI::ReleaseResources is called.
+  std::vector<void*> current_allocations() {
+    std::vector<void*> allocated;
+    std::lock_guard<std::mutex> lock(map_mutex_);
+    for (const auto& [data_ptr, buffer] : hexagon_buffer_map_) {
+      allocated.push_back(data_ptr);
+    }
+    return allocated;
+  }
+
  private:
   //! \brief Contains the HexagonBuffer objects managed by this class.
   std::unordered_map<void*, std::unique_ptr<HexagonBuffer>> hexagon_buffer_map_;
+
+  //! \brief Protects updates to the map.
+  std::mutex map_mutex_;
 };
 
 }  // namespace hexagon
