@@ -19,17 +19,59 @@ import argparse
 import fnmatch
 import re
 from pathlib import Path
+from typing import List, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-EXPECTED = """
+
+EXPECTED_HOOK = """
 # sphinx_gallery_start_ignore
 from tvm import testing
 
-testing.utils.install_request_hook(depth=3)
+testing.utils.install_request_hook(depth=3)\
 # sphinx_gallery_end_ignore
-""".rstrip()
+"""
+
+# Extra sphinx-gallery config options may be passed inside the ignore block before the hook. This
+# is a workaround that can be removed once sphinx-gallery #1059 merges and the version is updated.
+EXPECTED_REGEX = re.compile(
+    r"""
+\# sphinx_gallery_start_ignore
+(?:.*\n)*from tvm import testing
+
+testing\.utils\.install_request_hook\(depth=3\)\
+\# sphinx_gallery_end_ignore
+""".rstrip(),
+    re.MULTILINE,
+)
 IGNORE_PATTERNS = ["*/micro_tvmc.py", "*/micro_train.py"]
+APACHE_HEADER_LINES = 16
+
+
+def find_code_block_line(lines: List[str]) -> Optional[int]:
+    """
+    This returns the index in 'lines' of the first line of code in the tutorial
+    or none if there are no code blocks.
+    """
+    in_multiline_string = False
+    in_sphinx_directive = False
+
+    i = 0
+    lines = lines[APACHE_HEADER_LINES:]
+    while i < len(lines):
+        line = lines[i].strip()
+        if '"""' in line:
+            in_multiline_string = not in_multiline_string
+        elif "# sphinx_gallery_" in line:
+            in_sphinx_directive = not in_sphinx_directive
+        elif line.startswith("#") or in_sphinx_directive or in_multiline_string or line == "":
+            pass
+        else:
+            return i
+        i += 1
+
+    return None
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -41,6 +83,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     gallery_files = (REPO_ROOT / "gallery").glob("**/*.py")
+    # gallery_files = [x for x in gallery_files if "cross_compi" in str(x)]
 
     errors = []
     for file in gallery_files:
@@ -55,24 +98,43 @@ if __name__ == "__main__":
         with open(file) as f:
             content = f.read()
 
-        if EXPECTED not in content:
-            errors.append(file)
+        regex_match = EXPECTED_REGEX.search(content)
+        if not regex_match:
+            errors.append((file, None))
+            continue
+
+        line = content.count("\n", 0, regex_match.end()) + 2
+        expected = find_code_block_line(content.split("\n"))
+        if expected is not None and line < expected:
+            errors.append((file, (line, expected)))
 
     if args.fix:
-        for error in errors:
+        for error, line_info in errors:
             with open(error) as f:
                 content = f.read()
 
+            # Note: There must be a little bit of care taken here since inserting
+            # the block between a comment and multiline string will lead to an
+            # empty code block in the HTML output
             if "from __future__" in content:
                 # Place after the last __future__ import
                 new_content = re.sub(
-                    r"((?:from __future__.*?\n)+)", r"\1\n" + EXPECTED, content, flags=re.MULTILINE
+                    r"((?:from __future__.*?\n)+)", r"\1\n" + EXPECTED_HOOK, content, flags=re.M
                 )
             else:
-                # Place after the module doc comment
-                new_content = re.sub(
-                    r"(\"\"\"(?:.*\n)+\"\"\")", r"\1\n" + EXPECTED, content, flags=re.MULTILINE
-                )
+                # Place in the first codeblock
+                lines = content.split("\n")
+                position = find_code_block_line(lines)
+                if position is None:
+                    new_content = "\n".join(lines) + EXPECTED_HOOK + "\n"
+                else:
+                    print(position)
+                    new_content = (
+                        "\n".join(lines[:position])
+                        + EXPECTED_HOOK
+                        + "\n\n"
+                        + "\n".join(lines[position:])
+                    )
 
             with open(error, "w") as f:
                 f.write(new_content)
@@ -80,12 +142,19 @@ if __name__ == "__main__":
         # Don't fix, just check and print an error message
         if len(errors) > 0:
             print(
-                f"These {len(errors)} files did not contain the expected text to "
-                "override urllib.request.Request.\n"
+                f"These {len(errors)} file(s) did not contain the expected text to "
+                "override urllib.request.Request, it was at the wrong position, or "
+                "the whitespace is incorrect.\n"
                 "You can run 'python3 tests/lint/check_request_hook.py --fix' to "
                 "automatically fix these errors:\n"
-                f"{EXPECTED}\n\nFiles:\n" + "\n".join([str(error_path) for error_path in errors])
+                f"{EXPECTED_HOOK}\n\nFiles:"
             )
+            for file, line_info in errors:
+                if line_info is None:
+                    print(f"{file} (missing hook)")
+                else:
+                    actual, expected = line_info
+                    print(f"{file} (misplaced hook at {actual}, expected at {expected})")
             exit(1)
         else:
             print("All files successfully override urllib.request.Request")

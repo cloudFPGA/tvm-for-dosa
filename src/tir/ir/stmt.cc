@@ -641,7 +641,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     });
 
 // IfThenElse
-IfThenElse::IfThenElse(PrimExpr condition, Stmt then_case, Stmt else_case, Span span) {
+IfThenElse::IfThenElse(PrimExpr condition, Stmt then_case, Optional<Stmt> else_case, Span span) {
   ICHECK(condition.defined());
   ICHECK(then_case.defined());
   // else_case may be null.
@@ -670,7 +670,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
         p->Print(op->then_case);
         p->indent -= 2;
 
-        if (!op->else_case.defined()) {
+        if (!op->else_case) {
           break;
         }
 
@@ -1088,7 +1088,7 @@ PrimExpr TypeAnnotation(DataType dtype, Span span) {
   return tir::Call(dtype, op, {}, span);
 }
 
-TVM_REGISTER_OP("tir.type_annotation")
+TVM_TIR_REGISTER_OP("type_annotation")
     .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kPure));
 
 }  // namespace tir

@@ -17,12 +17,20 @@
 """
 Wrap Your TVMScript as PyTorch Module
 ======================
-**Author**: 
+**Author**:
 `Yaoda Zhou <https://github.com/juda>`_
 
 This article is a tutorial on wrapping the TVMScript code as the PyTorch module.
 Using the decorator `as_torch`, users can wrap TVMScript code into a PyTorch nn.Module naturally.
+To follow the tutorial, PyTorch should be installed:
+
+.. code-block:: bash
+
+    %%shell
+    pip install torch
+
 """
+
 
 # sphinx_gallery_start_ignore
 from tvm import testing

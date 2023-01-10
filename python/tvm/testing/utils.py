@@ -900,8 +900,8 @@ requires_opencl = Feature(
     "OpenCL",
     cmake_flag="USE_OPENCL",
     target_kind_enabled="opencl",
-    target_kind_hardware="opencl",
-    parent_features="gpu",
+    target_kind_hardware="opencl" if "RPC_TARGET" not in os.environ else None,
+    parent_features="gpu" if "RPC_TARGET" not in os.environ else None,
 )
 
 # Mark a test as requiring the rocm runtime
@@ -933,6 +933,15 @@ requires_vulkan = Feature(
     target_kind_hardware="vulkan",
     parent_features="gpu",
 )
+
+# Mark a test as requiring OpenCLML support in build.
+requires_openclml = Feature(
+    "OpenCLML",
+    "CLML",
+    cmake_flag="USE_CLML",
+    target_kind_enabled="opencl",
+)
+
 
 # Mark a test as requiring microTVM to run
 requires_micro = Feature("micro", "MicroTVM", cmake_flag="USE_MICRO")
@@ -2072,3 +2081,25 @@ class CompareBeforeAfter:
                 f"or an instance of `tvm.tir.PrimFunc`.  "
                 f"Instead, received {type(expected)}."
             )
+
+
+class _control_span_filling:
+    def __init__(self, on=True):
+        self._on = on
+        self._pass_ctx = tvm.transform.PassContext(config={"relay.frontend.fill_span": self._on})
+
+    def __enter__(self):
+        self._pass_ctx.__enter__()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._pass_ctx.__exit__(exc_type, exc_val, exc_tb)
+
+
+class enable_span_filling(_control_span_filling):
+    def __init__(self):
+        super().__init__()
+
+
+class disable_span_filling(_control_span_filling):
+    def __init__(self):
+        super().__init__(on=False)
