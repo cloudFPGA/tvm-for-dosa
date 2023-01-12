@@ -65,9 +65,9 @@ class OperatorModuleWrapper(torch.nn.Module):
         measure_callbacks: ms.MeasureCallback.CallbackListType = "default",
         task_scheduler: ms.TaskScheduler.TaskSchedulerType = "round-robin",
         space: ms.SpaceGenerator.SpaceGeneratorType = "post-order-apply",
-        strategy: ms.SearchStrategy.SearchStrategyType = "replay_trace",
+        strategy: ms.SearchStrategy.SearchStrategyType = "replay-trace",
         task_name: str = "main",
-        num_threads: Union[Literal["physical", "logical"], int] = "physical",
+        num_tuning_cores: Union[Literal["physical", "logical"], int] = "physical",
         seed: Optional[int] = None,
     ) -> None:
         """
@@ -100,7 +100,7 @@ class OperatorModuleWrapper(torch.nn.Module):
                 space=space,
                 strategy=strategy,
                 task_name=task_name,
-                num_threads=num_threads,
+                num_tuning_cores=num_tuning_cores,
                 seed=seed,
             )
             sch = ms.tir_integration.compile_tir(database, self.ir_module, target)
@@ -112,7 +112,10 @@ class OperatorModuleWrapper(torch.nn.Module):
 
     def build(self, target=None):
         runtime_module = tvm.build(self.ir_module, target=target)
-        func = tvm.get_global_func("tvmtorch.save_runtime_mod")
+        func = tvm.get_global_func("tvmtorch.save_runtime_mod", allow_missing=True)
+
+        if func is None:
+            raise ValueError('as_torch requires the flag /"USE_PT_TVMDSOOP/" set in config.cmake')
         func(runtime_module)
 
         self.rt_module = torch.classes.tvm_torch.OperatorModuleWrapper()

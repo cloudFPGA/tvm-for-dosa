@@ -1863,6 +1863,13 @@ class PyTorchOpConverter:
 
         return _op.split(data, indeces, axis)
 
+    def baddbmm(self, inputs, _):
+        input = inputs[0]
+        batch1, batch2 = inputs[1:3]
+        beta = _expr.const(float(inputs[3]))
+        alpha = _expr.const(float(inputs[4]))
+        return beta * input + alpha * _op.nn.batch_matmul(batch1, batch2, transpose_b=False)
+
     def matmul(self, inputs, input_types):
 
         inputs_0 = inputs[0]
@@ -2323,8 +2330,19 @@ class PyTorchOpConverter:
 
     def index(self, inputs, input_types):
         data = inputs[0]
-        indices = inputs[1]
-        return _op.adv_index([data] + indices)
+        indices_list = []
+
+        for indices in inputs[1]:
+            if self.infer_type(indices).dtype == "bool":
+                # adv_index does not support a mask as the index tensor (it will treat 0/1 as
+                # an index rather than a flag).
+                # So we use argwhere to turn the mask into indices, which will also take care
+                # of the dynamism in the indexing by mask.
+                indices_list.append(_op.squeeze(_op.transform.argwhere(indices), axis=[1]))
+            else:
+                indices_list.append(indices)
+
+        return _op.adv_index([data] + indices_list)
 
     def meshgrid(self, inputs, input_types):
         data = inputs[0]
@@ -2554,7 +2572,14 @@ class PyTorchOpConverter:
         return _op.ndarray_size(inputs[0])
 
     def empty(self, inputs, input_types):
-        shape = inputs[0]
+        shape = []
+        for s in inputs[0]:
+            if isinstance(s, _expr.Constant):
+                shape.append(s.data.numpy().item())
+            else:
+                assert isinstance(s, int)
+                shape.append(s)
+
         return _op.zeros(shape, _convert_dtype_value(inputs[1]))
 
     def empty_like(self, inputs, input_types):
@@ -3489,6 +3514,20 @@ class PyTorchOpConverter:
         _, indices = _expr.TupleWrapper(output, 2)
         return indices
 
+    def weight_norm(self, inputs, input_types):
+        weight_v, weight_g = inputs[0], inputs[1]
+        dim = inputs[2]
+        dtype = input_types[0]
+        order = 2.0
+        reci_order = _expr.const(1.0 / order, dtype=dtype)
+        order = _expr.const(order)
+
+        norm_v = _op.power(
+            _op.reduce.sum(_op.power(_op.abs(weight_v), order), axis=dim, exclude=2, keepdims=True),
+            reci_order,
+        )
+        return weight_g * (weight_v / norm_v)
+
     # Operator mappings
     def create_convert_map(self):
         self.convert_map = {
@@ -3610,6 +3649,7 @@ class PyTorchOpConverter:
             "aten::unsafe_chunk": self.chunk,
             "aten::matmul": self.matmul,
             "aten::bmm": self.matmul,
+            "aten::baddbmm": self.baddbmm,
             "aten::expand": self.expand,
             "aten::Int": self.int,
             "prim::NumToTensor": self.numtotensor,
@@ -3755,6 +3795,7 @@ class PyTorchOpConverter:
             "aten::__lshift__": self.make_elemwise("left_shift"),
             "aten::__rshift__": self.make_elemwise("right_shift"),
             "aten::multinomial": self.multinomial,
+            "aten::_weight_norm": self.weight_norm,
         }
 
     def update_convert_map(self, custom_map):
@@ -4576,6 +4617,7 @@ def from_pytorch(
         if inp.type().kind() == "TupleType" or inp.type().kind() == "ListType":
             enable_lower_all_tuples = False
             break
+
     _run_jit_passes(graph, enable_lower_all_tuples)
 
     if custom_convert_map:

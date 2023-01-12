@@ -17,7 +17,7 @@
 """MetaSchedule-Relay integration"""
 from contextlib import contextmanager
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, Set
 
 # isort: off
 from typing_extensions import Literal
@@ -119,6 +119,8 @@ def extract_tasks(
         }
     ),
     executor: Optional["relay.backend.Executor"] = None,
+    module_equality: str = "structural",
+    disabled_pass: Optional[Union[List[str], Set[str], Tuple[str]]] = None,
 ) -> List[ExtractedTask]:
     """Extract tuning tasks from a relay program.
 
@@ -136,6 +138,18 @@ def extract_tasks(
         The pass configuration
     executor : Optional[relay.backend.Executor]
         The executor to use
+    module_equality : Optional[str]
+        A string to specify the module equality testing and hashing method.
+        It must be one of the followings:
+          - "structural": Use StructuralEqual/Hash
+          - "ignore-ndarray": Same as "structural", but ignore ndarray raw data during
+                              equality testing and hashing.
+          - "anchor-block": Apply equality testing and hashing on the anchor block extracted from a
+                            given module. The "ignore-ndarray" varint is used for the extracted
+                            blocks or in case no anchor block is found.
+                            For the definition of the anchor block, see tir/analysis/analysis.py.
+    disabled_pass : Optional[Union[List[str], Set[str], Tuple[str]]]
+        The list of disabled passes
 
     Returns
     -------
@@ -160,8 +174,9 @@ def extract_tasks(
             with transform.PassContext(
                 opt_level=opt_level,
                 config=pass_config,
+                disabled_pass=disabled_pass,
             ):
-                return list(_extract_task(mod, target, params))
+                return list(_extract_task(mod, target, params, module_equality))
 
 
 def extracted_tasks_to_tune_contexts(
@@ -169,7 +184,7 @@ def extracted_tasks_to_tune_contexts(
     work_dir: str,
     space: SpaceGenerator.SpaceGeneratorType = "post-order-apply",
     strategy: SearchStrategy.SearchStrategyType = "evolutionary",
-    num_threads: Union[Literal["physical", "logical"], int] = "physical",
+    num_tuning_cores: Union[Literal["physical", "logical"], int] = "physical",
     seed: Optional[int] = None,
 ) -> Tuple[List[TuneContext], List[float]]:
     """Convert ExtractedTask to TuneContext.
@@ -184,8 +199,8 @@ def extracted_tasks_to_tune_contexts(
         The space generator to use.
     strategy : SearchStrategy.SearchStrategyType
         The search strategy to use.
-    num_threads : Union[Literal["physical", "logical"], int]
-        The number of threads to use in multi-threaded search algorithm.
+    num_tuning_cores : Union[Literal["physical", "logical"], int]
+        The number of CPU cores to use during tuning.
     seed : Optional[int]
         The random seed to use.
 
@@ -212,7 +227,7 @@ def extracted_tasks_to_tune_contexts(
                 task_name=task.task_name,
                 logger=logger,
                 rand_state=rand_state,
-                num_threads=num_threads,
+                num_threads=num_tuning_cores,
             ).clone()
         )
         task_weights.append(task.weight)
@@ -237,6 +252,9 @@ def tune_relay(
     space: SpaceGenerator.SpaceGeneratorType = "post-order-apply",
     strategy: SearchStrategy.SearchStrategyType = "evolutionary",
     seed: Optional[int] = None,
+    module_equality: str = "structural",
+    num_tuning_cores: Union[Literal["physical", "logical"], int] = "physical",
+    disabled_pass: Optional[Union[List[str], Set[str], Tuple[str]]] = None,
 ) -> Database:
     """Tune a Relay program.
 
@@ -274,6 +292,20 @@ def tune_relay(
         The search strategy to use
     seed : Optional[int]
         The random seed
+    module_equality : Optional[str]
+        A string to specify the module equality testing and hashing method.
+        It must be one of the followings:
+          - "structural": Use StructuralEqual/Hash
+          - "ignore-ndarray": Same as "structural", but ignore ndarray raw data during
+                              equality testing and hashing.
+          - "anchor-block": Apply equality testing and hashing on the anchor block extracted from a
+                            given module. The "ignore-ndarray" varint is used for the extracted
+                            blocks or in case no anchor block is found.
+                            For the definition of the anchor block, see tir/analysis/analysis.py.
+    num_tuning_cores : Union[Literal["physical", "logical"], int]
+        The number of CPU cores to use during tuning.
+    disabled_pass : Optional[Union[List[str], Set[str], Tuple[str]]]
+        The list of disabled passes during tasks extraction
 
     Returns
     -------
@@ -281,11 +313,14 @@ def tune_relay(
         The database that contains the tuning records
     """
     tasks, task_weights = extracted_tasks_to_tune_contexts(
-        extracted_tasks=extract_tasks(mod, target, params),
+        extracted_tasks=extract_tasks(
+            mod, target, params, module_equality=module_equality, disabled_pass=disabled_pass
+        ),
         work_dir=work_dir,
         space=space,
         strategy=strategy,
         seed=seed,
+        num_tuning_cores=num_tuning_cores,
     )
     return tune_tasks(
         tasks=tasks,
@@ -300,6 +335,7 @@ def tune_relay(
         cost_model=cost_model,
         measure_callbacks=measure_callbacks,
         task_scheduler=task_scheduler,
+        module_equality=module_equality,
     )
 
 
@@ -318,6 +354,7 @@ def compile_relay(
         }
     ),
     executor: Optional["relay.backend.Executor"] = None,
+    disabled_pass: Optional[Union[List[str], Set[str], Tuple[str]]] = None,
 ):
     """Compile a relay program with a MetaSchedule database.
 
@@ -341,6 +378,8 @@ def compile_relay(
         The pass configuration
     executor : Optional[relay.backend.Executor]
         The executor to use in relay.build. It is not supported by RelayVM.
+    disabled_pass : Optional[Union[List[str], Set[str], Tuple[str]]]
+        The list of disabled passes
 
     Returns
     -------
@@ -354,12 +393,13 @@ def compile_relay(
     mod, target, params, pass_config, executor = _normalize_params(
         mod, target, params, pass_config, executor
     )
-    pass_config.setdefault("relay.backend.use_meta_schedule_dispatch", target.kind.name != "cuda")
+    pass_config.setdefault("relay.backend.use_meta_schedule_dispatch", True)
     with Profiler.timeit("PostTuningCompilation"):
         with target, _autotvm_silencer(), database:
             with transform.PassContext(
                 opt_level=opt_level,
                 config=pass_config,
+                disabled_pass=disabled_pass,
             ):
                 if backend == "graph":
                     return relay.build(mod, target=target, params=params, executor=executor)
@@ -379,19 +419,5 @@ def is_meta_schedule_enabled() -> bool:
     """
     return transform.PassContext.current().config.get(
         "relay.backend.use_meta_schedule",
-        False,
-    )
-
-
-def is_meta_schedule_dispatch_enabled() -> bool:
-    """Return whether the meta-schedule dispatch is enabled.
-
-    Returns
-    -------
-    enabled: bool
-        Whether the meta schedule is enabled
-    """
-    return transform.PassContext.current().config.get(
-        "relay.backend.use_meta_schedule_dispatch",
         False,
     )
