@@ -682,3 +682,7 @@ class EinsumAttrs(Attrs):
 @tvm._ffi.register_object("relay.attrs.StftAttrs")
 class StftAttrs(Attrs):
     """Attributes used in stft operators"""
+
+@tvm._ffi.register_object("relay.attrs.MultiThresholdAttrs")
+class MultiThresholdAttrs(Attrs):
+    """Attributes used in MultiThresholds operators"""

@@ -5279,7 +5279,7 @@ class ConcatFromSequence(OnnxOpConverter):
 
 
 # compatible operators that do NOT require any conversion.
-_identity_list = []
+_identity_list = ["MultiThreshold"]
 
 # _convert_map defines maps of name to converter functor(callable)
 # for 1 to 1 mapping, use Renamer if nothing but name is different
