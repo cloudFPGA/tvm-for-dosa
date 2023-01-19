@@ -21,6 +21,10 @@
  * \file src/relay/op/contrib/ethosu/pooling.cc
  * \brief Pooling operators definitions for the Arm(R) Ethos(TM)-U NPU.
  */
+
+#include <cstring>
+#include <cmath>
+
 #include <tvm/relay/attrs/finn.h>
 #include <tvm/relay/op.h>
 
@@ -35,18 +39,64 @@ namespace contrib {
 
 TVM_REGISTER_NODE_TYPE(MultiThresholdAttrs);
 
+bool try_process_out_dtype(std::string out_dtype, bool& is_signed, int& bit_width) {
+    std::size_t found = out_dtype.find("UINT");
+    std::size_t bit_width_index = 4;
+    is_signed = found == std::string::npos;
+
+    if (found == std::string::npos) {
+        found = out_dtype.find("INT");
+        bit_width_index = 3;
+        if (found == std::string::npos) return false;
+    }
+
+    std::string bit_width_str = out_dtype.substr(bit_width_index);
+    if (bit_width_str.size() == 0 || bit_width_str.size() > 2) return false;
+
+    try {
+        bit_width = std::stoi(bit_width_str);
+        if (bit_width > 64) return false;
+        return true;
+    }
+    catch (...) {
+        return false;
+    }
+}
+
 bool MultiThresholdRel(const Array<Type>& types, int num_inputs, const Attrs& attrs, const TypeReporter& reporter) {
     ICHECK_EQ(types.size(), 3);
     const auto* data = types[0].as<TensorTypeNode>();
     if (data == nullptr) return false;
 
+    const auto* thresholds = types[0].as<TensorTypeNode>();
+    if (thresholds == nullptr) return false;
+
     const MultiThresholdAttrs* params = attrs.as<MultiThresholdAttrs>();
     ICHECK(params != nullptr);
     String out_dtype = params->out_dtype;
+    double out_bias = params->out_bias;
 
-    if (out_dtype == "") {
+    bool out_dtype_signed(true);
+    int bit_width(0);
+    if (!try_process_out_dtype(static_cast<std::string>(out_dtype), out_dtype_signed, bit_width)) {
         reporter->GetDiagCtx().EmitFatal(Diagnostic::Error(reporter->GetSpan())
-                                     << "The output dtype must be defined;");
+                                     << "MultiThreshold out_dtype bad format.");
+        return false;
+    }
+
+    int bit_width_pow = std::pow(2, bit_width);
+    std::size_t thresh_last_index = thresholds->shape.size();
+    reporter->AssertEQ(thresholds->shape[thresh_last_index - 1], bit_width_pow);
+
+    if (out_dtype_signed && out_bias != -bit_width_pow / 2) {
+        reporter->GetDiagCtx().EmitFatal(Diagnostic::Error(reporter->GetSpan())
+                                     << "For a signed out_dtype, out_bias must correspond to 2**(bit_width)/2");
+        return false;
+    }
+
+    if (!out_dtype_signed && out_bias != 0) {
+        reporter->GetDiagCtx().EmitFatal(Diagnostic::Error(reporter->GetSpan())
+                                     << "For an unsigned out_dtype, the out_bias must correspond to zero.");
         return false;
     }
 

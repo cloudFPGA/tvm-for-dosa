@@ -13,7 +13,13 @@ def elemwise_shape_func(attrs, inputs, _):
     return [topi.math.identity(inputs[0])]
 
 def MultiThreshold_compute(attrs, inputs, out_type):
-    return inputs[0]
+    """compute definition for MultiThreshold"""
+    data = inputs[0]
+    thresholds = inputs[1]
+    out_dtype = attrs.out_dtype
+    bias = attrs.out_bias
+
+    return data
 
 _reg.register_shape_func("MultiThreshold", False, elemwise_shape_func)
 _reg.register_compute("MultiThreshold", MultiThreshold_compute)
