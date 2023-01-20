@@ -5942,10 +5942,19 @@ class SequenceAt(OnnxOpConverter):
         # Convert position to integer.
         position = int(position.data.numpy())
         return input_sequence[position]
+    
+    
+class MultiThreshold(OnnxOpConverter):
+    """Operator converter for MultiThreshold op."""
+
+    @classmethod
+    def _impl_v1(cls, inputs, attr, params):
+        assert len(inputs) == 2, "MultiThreshold op take 2 inputs, {} given".format(len(inputs))
+        return _op.nn.multi_threshold(inputs[0], inputs[1], attr.get("out_dtype"), attr.get("out_bias"))
 
 
 # compatible operators that do NOT require any conversion.
-_identity_list = ["MultiThreshold"]
+_identity_list = []
 
 # _convert_map defines maps of name to converter functor(callable)
 # for 1 to 1 mapping, use Renamer if nothing but name is different
@@ -5990,6 +5999,7 @@ def _get_convert_map(opset):
         "Div": Div.get_converter(opset),
         "Neg": Renamer("negative"),
         "Abs": Absolute.get_converter(opset),
+        "MultiThreshold" : MultiThreshold.get_converter(opset),
         "Reciprocal": Reciprocal.get_converter(opset),
         "Floor": Renamer("floor"),
         "Ceil": Renamer("ceil"),

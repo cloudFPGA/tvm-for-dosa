@@ -33,6 +33,7 @@ from .. import strategy
 from .._tensor import elemwise_shape_func
 from ..strategy.generic import is_depthwise_conv2d
 
+
 # relu
 reg.register_broadcast_schedule("nn.relu")
 
@@ -665,6 +666,18 @@ def compute_lrn(attrs, inputs, out_dtype):
 
 
 reg.register_schedule("nn.lrn", strategy.schedule_lrn)
+
+# multi_threshold
+@reg.register_compute("nn.multi_threshold")
+def compute_multi_threshold(attrs, inputs, out_dtype):
+    """Compute definition of multithreshold"""
+    assert len(inputs) == 2
+    signed = 'UINT' not in attrs.out_dtype
+    bit_width = int(''.join([c for c in attrs.out_dtype if c.isdigit()]))
+    out_bias = int(attrs.out_bias)
+    return [topi.nn.multi_threshold(inputs[0], inputs[1],bit_width, signed, out_bias)]
+
+reg.register_broadcast_schedule("nn.multi_threshold")
 
 
 # upsampling
@@ -1523,6 +1536,7 @@ def dilate_shape_func(attrs, inputs, _):
 reg.register_shape_func("nn.bias_add", False, elemwise_shape_func)
 reg.register_shape_func("nn.softmax", False, elemwise_shape_func)
 reg.register_shape_func("nn.fast_softmax", False, elemwise_shape_func)
+reg.register_shape_func("nn.multi_threshold", False, elemwise_shape_func)
 reg.register_shape_func("nn.relu", False, elemwise_shape_func)
 reg.register_shape_func("nn.leaky_relu", False, elemwise_shape_func)
 reg.register_shape_func("nn.prelu", False, elemwise_shape_func)

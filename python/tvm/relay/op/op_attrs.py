@@ -685,4 +685,4 @@ class StftAttrs(Attrs):
 
 @tvm._ffi.register_object("relay.attrs.MultiThresholdAttrs")
 class MultiThresholdAttrs(Attrs):
-    """Attributes used in MultiThresholds operators"""
+    """Attributes used in multi_threshold operators"""

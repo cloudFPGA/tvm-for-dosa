@@ -1274,6 +1274,17 @@ struct MirrorPadAttrs : public tvm::AttrsNode<MirrorPadAttrs> {
   }
 };
 
+/*! \brief Attributes used in FINN MultiThreshold operator */
+struct MultiThresholdAttrs: public tvm::AttrsNode<MultiThresholdAttrs> {
+    tvm::String out_dtype;
+    double out_bias;
+
+    TVM_DECLARE_ATTRS(MultiThresholdAttrs, "relay.attrs.MultiThresholdAttrs") {
+        TVM_ATTR_FIELD(out_dtype).describe("The output dtype of the data");
+        TVM_ATTR_FIELD(out_bias).describe("The bias added to the data (typically for unsigned integer)");
+    }
+};
+
 /*! \brief Attributes for leaky relu operator */
 struct LeakyReluAttrs : public tvm::AttrsNode<LeakyReluAttrs> {
   double alpha;
