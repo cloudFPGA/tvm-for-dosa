@@ -88,11 +88,13 @@ bool MultiThresholdRel(const Array<Type>& types, int num_inputs, const Attrs& at
 
     bool out_dtype_signed(true);
     int bit_width(0);
+    /*
     if (!try_process_out_dtype(static_cast<std::string>(out_dtype), out_dtype_signed, bit_width)) {
         reporter->GetDiagCtx().EmitFatal(Diagnostic::Error(reporter->GetSpan())
                                      << "MultiThreshold out_dtype bad format.");
         return false;
     }
+    */
 
     int bit_width_pow = std::pow(2, bit_width);
     std::size_t thresh_last_index = thresholds->shape.size();
